@@ -1643,7 +1643,7 @@ class YOLO_octron:
     
     
     def predict_batch(self, 
-                  videos_dict,
+                  videos,
                   model_path,
                   device,
                   tracker_name,
@@ -1662,8 +1662,12 @@ class YOLO_octron:
         
         Parameters
         ----------
-        videos_dict : dict
-            Dictionary of video paths and video dictionaries with metadata.
+        videos : dict, str, Path, or list
+            Can be one of:
+            - dict: Dictionary of video names to video dictionaries with metadata (GUI format)
+            - str or Path: Single video file path
+            - list: List of video file paths (str or Path)
+            When passing paths, video metadata will be automatically probed.
         model_path : str or Path
             Path to the YOLO model to use for prediction.
         device : str
@@ -1709,6 +1713,28 @@ class YOLO_octron:
             - eta_finish_time: Estimated finish time timestamp
             - overall_progress: Overall progress as percentage (0-100)
         """
+        
+        # Handle different input formats for videos parameter
+        if not isinstance(videos, dict):
+            # Convert single path or list of paths to proper format
+            from octron.sam_octron.helpers.video_loader import probe_video
+            from napari_pyav._reader import FastVideoReader
+            
+            # Ensure it's a list
+            if isinstance(videos, (str, Path)):
+                video_paths = [Path(videos)]
+            else:
+                video_paths = [Path(p) for p in videos]
+            
+            # Build the videos_dict (internal format) from paths
+            videos_dict = {}
+            for video_path in video_paths:
+                video_dict = probe_video(video_path, verbose=False)
+                video_dict['video'] = FastVideoReader(video_path, read_format='rgb24')
+                videos_dict[video_dict['video_name']] = video_dict
+        else:
+            # Already in dict format (GUI usage)
+            videos_dict = videos
         
         # Check Boxmot tracker configuration
         # A tracker can either be directly linked via the config file (tracker_cfg_path)

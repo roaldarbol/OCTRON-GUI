@@ -1000,9 +1000,10 @@ class YoloHandler(QObject):
         else:
             show_info(f"Predicting on device: '{self.device_label}'")
         
-        # Call the training function which yields progress info
+        # Call the prediction function which yields progress info
+        # self.videos_to_predict is a dict: {video_name: video_metadata_dict}
         for progress_info in self.yolo.predict_batch(
-                                            videos_dict=self.videos_to_predict,
+                                            videos=self.videos_to_predict,
                                             model_path=self.model_predict_path,
                                             device=self.device_label,
                                             tracker_name=self.yolo_tracker_name,
