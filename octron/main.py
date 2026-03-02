@@ -690,6 +690,9 @@ class octron_widget(QWidget):
                                     min_num_frames=0
                                     )  
         if not label_dict:
+            # Clear the table if a model already exists (e.g. switching projects)
+            if hasattr(self, 'label_table_model'):
+                self.label_table_model.update_data({}, delete_old=True)
             return
         
         # Initialize the table model if not already done
