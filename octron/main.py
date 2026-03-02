@@ -1337,11 +1337,11 @@ class octron_widget(QWidget):
         predictor_image_size = self.predictor.image_size # SAM2 model image size
         largest_edge = max(video_height, video_width) 
 
-        image_scaler = predictor_image_size / largest_edge
-        # Resize both (!) edges to the same size 
-        # This is a hack since I did not get SAM2 to work for non-square videos
-        resized_height = int(np.floor(image_scaler * largest_edge)) 
-        resized_width = int(np.floor(image_scaler * largest_edge))
+        # Resize both (!) edges to the same square size matching the model's expected input.
+        # Use predictor_image_size directly to avoid floating-point rounding errors
+        # (e.g. int(floor(1008/1337*1337)) can yield 1007 instead of 1008).
+        resized_height = predictor_image_size
+        resized_width = predictor_image_size
         print(f'📐 Resized video dimensions: {resized_height}x{resized_width}')
         
         # Create zarr store for video layer

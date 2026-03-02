@@ -238,7 +238,8 @@ class SAM3_octron:
         storage_device = self.inference_state["storage_device"]
         maskmem_features = current_out["maskmem_features"]
         if maskmem_features is not None:
-            maskmem_features = maskmem_features.to(torch.bfloat16)
+            mem_dtype = torch.float32 if storage_device.type == "mps" else torch.bfloat16
+            maskmem_features = maskmem_features.to(mem_dtype)
             maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
         
         pred_masks_gpu = current_out["pred_masks"]
@@ -418,8 +419,9 @@ class SAM3_octron:
             object_score_logits=object_score_logits.float(),
         )
         maskmem_pos_enc_out = self._get_maskmem_pos_enc({"maskmem_pos_enc": maskmem_pos_enc})
+        mem_dtype = torch.float32 if self.device.type == "mps" else torch.float16
         return maskmem_features.to(
-            dtype=torch.float16, device=self.device, non_blocking=True
+            dtype=mem_dtype, device=self.device, non_blocking=True
         ), maskmem_pos_enc_out
     
     def _add_output_per_object(self, frame_idx, current_out, storage_key):

@@ -175,7 +175,8 @@ class SAM2_octron(SAM2VideoPredictor):
         storage_device = self.inference_state["storage_device"]
         maskmem_features = current_out["maskmem_features"]
         if maskmem_features is not None:
-            maskmem_features = maskmem_features.to(torch.bfloat16)
+            mem_dtype = torch.float32 if storage_device.type == "mps" else torch.bfloat16
+            maskmem_features = maskmem_features.to(mem_dtype)
             maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
         pred_masks_gpu = current_out["pred_masks"]
         
