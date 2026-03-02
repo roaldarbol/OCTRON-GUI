@@ -1465,54 +1465,111 @@ class YOLO_octron:
         pass
     
     @staticmethod
-    def get_model_task(model_path):
+    def get_model_info(model_path):
         """
-        Determine the task type ('detect' or 'segment') of a trained YOLO model
-        by reading the checkpoint metadata.
-        
+        Extract metadata from a trained YOLO model checkpoint for display
+        in a tooltip.
+
         Parameters
         ----------
         model_path : str or Path
             Path to the .pt model file
-            
+
         Returns
         -------
-        str or None
-            'detect', 'segment', or None if the task could not be determined
+        dict
+            Dictionary with keys: task, architecture, imgsz, epochs,
+            num_classes, class_names, trained_on.  Values are None when
+            the information could not be determined.
         """
         import torch
+        from pathlib import Path
+        import os, time as _time
+
+        info = dict(
+            task=None, architecture=None, imgsz=None, epochs=None,
+            num_classes=None, class_names=None, trained_on=None,
+        )
+
+        model_path = Path(model_path)
         try:
             ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
-            # Primary: check train_args dict
-            train_args = ckpt.get('train_args', {})
-            if isinstance(train_args, dict) and 'task' in train_args:
-                return train_args['task']
-            # Fallback: infer from model class name
-            if 'model' in ckpt:
-                class_name = type(ckpt['model']).__name__
-                if 'Segment' in class_name:
-                    return 'segment'
-                elif 'Detect' in class_name:
-                    return 'detect'
         except Exception as e:
-            print(f"Could not determine task for '{model_path}': {e}")
-        return None
+            print(f"Could not read checkpoint '{model_path}': {e}")
+            return info
+
+        train_args = ckpt.get('train_args', {})
+        if not isinstance(train_args, dict):
+            train_args = {}
+
+        # Task
+        info['task'] = train_args.get('task')
+        if info['task'] is None and 'model' in ckpt:
+            cls_name = type(ckpt['model']).__name__
+            if 'Segment' in cls_name:
+                info['task'] = 'segment'
+            elif 'Detect' in cls_name:
+                info['task'] = 'detect'
+
+        # Architecture / base model (store just the filename, not the full path)
+        arch = train_args.get('model')
+        if arch:
+            # Use PurePosixPath split + backslash split to handle both Unix and Windows paths
+            info['architecture'] = str(arch).replace('\\', '/').rsplit('/', 1)[-1]
+
+        # Image size
+        imgsz = train_args.get('imgsz')
+        if imgsz is not None:
+            info['imgsz'] = imgsz
+
+        # Epochs
+        info['epochs'] = train_args.get('epochs')
+
+        # Class names & count — try model object first, then top-level 'names'
+        names = None
+        model_obj = ckpt.get('model', None)
+        if model_obj is not None and hasattr(model_obj, 'names'):
+            names = model_obj.names
+        if names is None:
+            names = ckpt.get('names')
+        if isinstance(names, dict):
+            info['class_names'] = list(names.values())
+            info['num_classes'] = len(names)
+        elif isinstance(names, (list, tuple)):
+            info['class_names'] = list(names)
+            info['num_classes'] = len(names)
+
+        # Training date from file modification time
+        try:
+            mtime = os.path.getmtime(model_path)
+            info['trained_on'] = _time.strftime('%Y-%m-%d %H:%M', _time.localtime(mtime))
+        except OSError:
+            pass
+
+        return info
 
     def find_trained_models(self, 
                            search_path, 
-                           subfolder_route='training/weights',
+                           model_parent='model',
+                           weights_folder='weights',
                            model_suffix='.pt',
                            ):
         """
-        Find all trained models in the training directory
+        Find all trained models inside 'weights' directories under the
+        project's 'model' subfolder.  This picks up .pt files from any
+        training run layout, e.g. model/training/weights/,
+        model/training_segmentation/weights/, etc.
         
         Parameters
         ----------
-        project_path : str or Path
+        search_path : str or Path
             Path to the project directory
-        subfolder_route : str
-            Subfolder route to the models. 
-            This defaults to 'training/weights' for trained OCTRON YOLO models.   
+        model_parent : str
+            Name of the top-level model directory inside the project
+            (default 'model').
+        weights_folder : str
+            Name of the directory that contains the .pt checkpoint files
+            (default 'weights').
         model_suffix : str
             Suffix of the model files to search for (e.g. '.pt')
             
@@ -1522,30 +1579,19 @@ class YOLO_octron:
         assert search_path.is_dir(), f"Search path {search_path} is not a directory"
         
         found_models_project = []
-        
-        route_as_path = Path(subfolder_route)
-        route_parts = route_as_path.parts
-        # Handle empty or '.' subfolder_route, meaning no specific intermediate path
-        if not route_parts or route_parts == ('.',):
-            route_parts = tuple()
 
         for dirpath_str, dirnames, filenames in os.walk(search_path.as_posix(), topdown=True):
-            # Prune directories: if a directory name itself contains '.zarr'
-            # This modification happens in-place and affects os.walk's traversal
-            dirnames[:] = [d for d in dirnames if '.zarr' not in d]
+            # Prune directories that cannot contain model weights.
+            # This modification happens in-place and affects os.walk's traversal.
+            dirnames[:] = [d for d in dirnames
+                           if '.zarr' not in d and d != 'training_data']
             
             current_dir_path = Path(dirpath_str)
-            current_dir_parts = current_dir_path.parts
 
-            # Check if current_dir_path ends with the components of subfolder_route
-            path_matches_route = False
-            if not route_parts: # If subfolder_route was empty or '.', any directory matches
-                path_matches_route = True
-            elif len(current_dir_parts) >= len(route_parts):
-                if current_dir_parts[-len(route_parts):] == route_parts:
-                    path_matches_route = True
-            
-            if path_matches_route:
+            # Match any directory named <weights_folder> that sits
+            # somewhere under a <model_parent> ancestor.
+            if (current_dir_path.name == weights_folder
+                    and model_parent in current_dir_path.parts):
                 for fname in filenames:
                     if fname.endswith(model_suffix):
                         found_models_project.append(current_dir_path / fname)
@@ -1653,7 +1699,8 @@ class YOLO_octron:
                   tracker_params=None,
                   skip_frames=0,
                   one_object_per_label=False,
-                  region_details=False,
+                  region_properties=None,
+                  extra_properties=None,
                   iou_thresh=.7,
                   conf_thresh=.5,
                   opening_radius=0,
@@ -1697,9 +1744,24 @@ class YOLO_octron:
             If True, only the first detected object of each label will be tracked
             and if more than one object is detected, only the first one with the highest confidence
             will be kept. Defaults to False.
-        region_details : bool 
-            Whether to extract region details like area, solidity etc. (regionprops) from the extracted
-            masks instead of just relying on bounding box info.
+        region_properties : list or tuple, optional
+            List of region properties to extract from segmentation masks via 
+            skimage.measure.regionprops_table (e.g. ['area', 'eccentricity', 'solidity']).
+            'centroid' and 'label' are always included internally.
+            If None (default), no regionprops extraction is performed (bbox-only mode).
+            See DEFAULT_REGION_PROPERTIES in constants.py for the standard set.
+            See https://scikit-image.org/docs/stable/api/skimage.measure.html#skimage.measure.regionprops_table
+        extra_properties : tuple of callables, optional
+            Custom measurement functions passed to skimage.measure.regionprops_table.
+            Each function must accept a region mask as first argument. If the function
+            requires pixel intensities, it must accept intensity_image as second argument.
+            The function's __name__ becomes the column name in the output CSV.
+            Example::
+            
+                def mean_brightness(regionmask, intensity_image):
+                    return np.mean(intensity_image[regionmask])
+                
+                predict_batch(..., extra_properties=(mean_brightness,))
         iou_thresh : float
             IOU threshold for detection
         conf_thresh : float
@@ -1794,14 +1856,20 @@ class YOLO_octron:
         assert model_path.exists(), f"Model path {model_path} does not exist."
         
         # Determine model task (detect vs segment)
-        model_task = self.get_model_task(model_path) or 'segment'
+        model_task = self.get_model_info(model_path).get('task') or 'segment'
         is_segment = (model_task == 'segment')
         print(f"Model task: {model_task} ({'segmentation' if is_segment else 'detection'})")
         
         # Detection models do not produce masks — disable mask-dependent options
+        region_details = bool(region_properties) or bool(extra_properties)
         if not is_segment:
+            region_properties = None
+            extra_properties = None
             region_details = False
             opening_radius = 0
+        
+        # Collect extra property column names from callable __name__
+        extra_prop_names = [fn.__name__ for fn in extra_properties] if extra_properties else []
         
         # Try to find model args 
         model_args = self.load_model_args(model_name_path=model_path)
@@ -2085,7 +2153,9 @@ class YOLO_octron:
                             mask_stores[track_id] = mask_store
                         
                         # Initialize tracking dataframe
-                        tracking_df = self.create_tracking_dataframe(video_dict, region_details=region_details)
+                        tracking_df = self.create_tracking_dataframe(video_dict, 
+                                                                     region_properties=region_properties,
+                                                                     extra_properties=extra_properties)
                         tracking_df.attrs['video_name'] = video_name
                         tracking_df.attrs['label'] = label
                         tracking_df.attrs['track_id'] = track_id
@@ -2143,41 +2213,43 @@ class YOLO_octron:
                     tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_y_max'] = bbox[3]
                     tracking_df.loc[(frame_no, frame_idx, track_id), 'confidence'] = conf
                                             
-                    # If the "Detailed" checkbox has been checked, supplement info from regionprops extraction
+                    # If region_properties or extra_properties are specified, supplement info from regionprops extraction
                     # (only available for segmentation models with masks)
                     regions_props = None
                     if region_details and is_segment:
-                        _, regions_props = find_objects_in_mask(mask, min_area=0)
+                        _, regions_props = find_objects_in_mask(
+                            mask, min_area=0, 
+                            properties=region_properties,
+                            intensity_image=frame,
+                            extra_properties=extra_properties,
+                        )
                         if not regions_props:
                             # Skip if no regions were found
                             continue
                         
                         # Handle multiple regions
-                        num_regions = len(regions_props)                    
-                        # Initialize accumulators for region properties
+                        num_regions = len(regions_props)
+                        # Accumulate centroid for pos_x/pos_y (always available)
                         pos_x_sum, pos_y_sum = 0, 0
-                        area_sum = 0
-                        eccentricity_sum = 0
-                        solidity_sum = 0 
-                        orientation_sum = 0
+                        # Collect all property names to accumulate (built-in + extra)
+                        all_prop_names = list(region_properties or []) + extra_prop_names
+                        # Initialize accumulators for all properties
+                        prop_sums = {prop: 0 for prop in all_prop_names}
                         # Loop over all regions and accumulate properties
                         for region_prop in regions_props:
                             centroid = region_prop['centroid']
                             pos_x_sum += centroid[1]  # x coordinate
                             pos_y_sum += centroid[0]  # y coordinate
-                            area_sum += region_prop['area']
-                            eccentricity_sum += region_prop['eccentricity']
-                            solidity_sum += region_prop['solidity']
-                            orientation_sum += region_prop['orientation']
+                            for prop in all_prop_names:
+                                if prop in region_prop:
+                                    prop_sums[prop] += region_prop[prop]
                     
                         # Store averages in DataFrame with flat column names
                         # pos_x and pos_y are being overwritten from the previous (cruder) bbox estimates
                         tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_x'] = pos_x_sum / num_regions
                         tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_y'] = pos_y_sum / num_regions
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'area'] = area_sum / num_regions
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'eccentricity'] = eccentricity_sum / num_regions
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'solidity'] = solidity_sum / num_regions
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'orientation'] = orientation_sum / num_regions
+                        for prop in all_prop_names:
+                            tracking_df.loc[(frame_no, frame_idx, track_id), prop] = prop_sums[prop] / num_regions
 
                 # A FRAME IS COMPLETE
             
@@ -2272,7 +2344,8 @@ class YOLO_octron:
                     "model_task": model_task,
                     "model_imgsz": imgsz,
                     "model_retina_masks": retina_masks,
-                    "region_details": region_details,
+                    "region_properties": list(region_properties) if region_properties else None,
+                    "extra_properties": [fn.__name__ for fn in extra_properties] if extra_properties else None,
                     "device": device,
                     "tracker_name": tracker_name,
                     "skip_frames": skip_frames,
@@ -2312,7 +2385,8 @@ class YOLO_octron:
     
     def create_tracking_dataframe(self, 
                                   video_dict, 
-                                  region_details=False
+                                  region_properties=None,
+                                  extra_properties=None,
                                   ):
         """
         Create an empty DataFrame for storing tracking data and associated metadata
@@ -2323,8 +2397,11 @@ class YOLO_octron:
         ----------
         video_dict : dict
             Dictionary with video metadata including num_frames
-        region_details : bool 
-            If True, add columns for region details like solidity, eccentricity etc. (regionprops)
+        region_properties : list or tuple, optional
+            List of region property names to include as extra columns (e.g. ['area', 'solidity']).
+            If None, only bounding-box columns are created.
+        extra_properties : tuple of callables, optional
+            Custom measurement functions. Each function's __name__ is added as a column.
             
         Returns
         -------
@@ -2333,33 +2410,27 @@ class YOLO_octron:
         """
         import pandas as pd
         assert 'num_frames_analyzed' in video_dict, "Video metadata must include 'num_frames_analyzed'"
-        # Create a flat column structure
-        if region_details: 
-            columns = ['confidence', 
-                    'pos_x', 
-                    'pos_y', 
-                    'bbox_area',
-                    'bbox_aspect_ratio',
-                    'bbox_x_min',
-                    'bbox_x_max',
-                    'bbox_y_min',
-                    'bbox_y_max',
-                    'area', 
-                    'eccentricity', 
-                    'solidity',
-                    'orientation',
-                    ]
-        else: 
-            columns = ['confidence', 
-                    'pos_x', 
-                    'pos_y', 
-                    'bbox_area',
-                    'bbox_aspect_ratio',
-                    'bbox_x_min',
-                    'bbox_x_max',
-                    'bbox_y_min',
-                    'bbox_y_max',
-                    ]
+        # Create a flat column structure — base columns are always present
+        columns = ['confidence', 
+                'pos_x', 
+                'pos_y', 
+                'bbox_area',
+                'bbox_aspect_ratio',
+                'bbox_x_min',
+                'bbox_x_max',
+                'bbox_y_min',
+                'bbox_y_max',
+                ]
+        # Append region property columns if requested
+        if region_properties:
+            for prop in region_properties:
+                if prop not in columns:
+                    columns.append(prop)
+        # Append extra property columns (from custom functions)
+        if extra_properties:
+            for fn in extra_properties:
+                if fn.__name__ not in columns:
+                    columns.append(fn.__name__)
 
         # Initialize the DataFrame with NaN values
         df = pd.DataFrame(

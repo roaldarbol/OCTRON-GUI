@@ -1,6 +1,6 @@
 import time
 import shutil
-from qtpy.QtCore import QObject
+from qtpy.QtCore import QObject, Qt
 from qtpy.QtWidgets import QMessageBox
 from napari.qt import create_worker
 from napari.utils.notifications import show_info, show_warning, show_error
@@ -18,7 +18,7 @@ from octron.tracking.tracker_config_ui import open_boxmot_tracker_config_dialog
 import yaml
 import torch
 from octron.tracking.helpers.tracker_vis import create_color_icon
-from octron.yolo_octron.constants import TASK_COLORS
+from octron.yolo_octron.constants import TASK_COLORS, DEFAULT_REGION_PROPERTIES
 
 class YoloHandler(QObject):
     def __init__(self, parent_widget, yolo_octron):
@@ -88,7 +88,7 @@ class YoloHandler(QObject):
         if model_path is None:
             return
 
-        task = self.yolo.get_model_task(model_path)
+        task = self.yolo.get_model_info(model_path).get('task')
         is_segment = (task == 'segment')
 
         # Opening and detailed extraction only apply to segmentation models
@@ -123,13 +123,18 @@ class YoloHandler(QObject):
             if model_name not in self.trained_models:
                 self.trained_models[model_name] = model
             # Add colored indicator square based on model task
-            task = self.yolo.get_model_task(model)
+            info = self.yolo.get_model_info(model)
+            task = info.get('task')
             color = TASK_COLORS.get(task)
             if color:
                 icon = create_color_icon(color)
                 self.w.yolomodel_trained_list.addItem(icon, model_name)
             else:
                 self.w.yolomodel_trained_list.addItem(model_name)
+            # Build a multi-line tooltip from the model metadata
+            tooltip = self._build_model_tooltip(info, model)
+            idx = self.w.yolomodel_trained_list.count() - 1
+            self.w.yolomodel_trained_list.setItemData(idx, tooltip, Qt.ToolTipRole)
         # Enable prediction tab if trained models are available
         self.w.main_toolbox.widget(3).setEnabled(True)
         self.w.predict_video_drop_groupbox.setEnabled(True)
@@ -139,6 +144,44 @@ class YoloHandler(QObject):
         self.w.predict_start_btn.setText(f'▷ Predict')
 
 
+
+    @staticmethod
+    def _build_model_tooltip(info, model_path):
+        """
+        Build a multi-line tooltip string from model metadata.
+        """
+        lines = []
+        # Model type
+        task = info.get('task')
+        if task:
+            task_label = 'Segmentation' if task == 'segment' else 'Detection'
+            lines.append(f"Model type: {task_label}")
+        # Architecture
+        arch = info.get('architecture')
+        if arch:
+            lines.append(f"Architecture: {arch}")
+        # Image size
+        imgsz = info.get('imgsz')
+        if imgsz is not None:
+            lines.append(f"Image size: {imgsz}")
+        # Epochs
+        epochs = info.get('epochs')
+        if epochs is not None:
+            lines.append(f"Epochs: {epochs}")
+        # Classes
+        num_classes = info.get('num_classes')
+        class_names = info.get('class_names')
+        if num_classes is not None and class_names:
+            lines.append(f"Classes ({num_classes}): {', '.join(class_names)}")
+        elif num_classes is not None:
+            lines.append(f"Classes: {num_classes}")
+        # Training date
+        trained_on = info.get('trained_on')
+        if trained_on:
+            lines.append(f"Trained: {trained_on}")
+        # Full path
+        lines.append(f"Path: {model_path}")
+        return '\n'.join(lines)
 
     #######################################################################################################
     # TRAINING‐DATA GENERATION PIPELINE 
@@ -973,7 +1016,7 @@ class YoloHandler(QObject):
         self.yolo_tracker_name = self.w.yolomodel_tracker_list.currentText().strip()                            
         self.view_prediction_results = self.w.open_when_finish_checkBox.isChecked()   
         self.one_object_per_label = self.w.single_subject_checkBox.isChecked()
-        self.region_details = self.w.detailed_extraction_checkBox.isChecked()
+        self.region_properties = list(DEFAULT_REGION_PROPERTIES) if self.w.detailed_extraction_checkBox.isChecked() else None
         self.overwrite_predictions = self.w.overwrite_prediction_checkBox.isChecked()    
         # ... floating point selectors 
         self.mask_opening = int(round(self.w.predict_mask_opening_spinbox.value()))
@@ -1002,6 +1045,9 @@ class YoloHandler(QObject):
         self.w.single_subject_checkBox.setEnabled(False)
         self.w.overwrite_prediction_checkBox.setEnabled(False)
         self.w.predict_conf_thresh_spinbox.setEnabled(False)
+        self.w.predict_mask_opening_spinbox.setEnabled(False)
+        self.w.predict_iou_thresh_spinbox.setEnabled(False)
+        self.w.detailed_extraction_checkBox.setEnabled(False)
         self.w.skip_frames_analysis_spinBox.setEnabled(False)
 
     def _create_yolo_predictor(self):
@@ -1031,7 +1077,7 @@ class YoloHandler(QObject):
                                             tracker_name=self.yolo_tracker_name,
                                             skip_frames=self.skip_frames,
                                             one_object_per_label=self.one_object_per_label,
-                                            region_details=self.region_details,
+                                            region_properties=self.region_properties,
                                             iou_thresh=self.iou_thresh,
                                             conf_thresh=self.conf_thresh,
                                             opening_radius=self.mask_opening,
@@ -1127,6 +1173,13 @@ class YoloHandler(QObject):
             self.w.overwrite_prediction_checkBox.setEnabled(True)
             self.w.predict_conf_thresh_spinbox.setEnabled(True)
             self.w.skip_frames_analysis_spinBox.setEnabled(True)
+            # Only re-enable mask-related controls if the selected model is a segmentation model
+            model_name = self.w.yolomodel_trained_list.currentText()
+            model_path = self.trained_models.get(model_name)
+            is_segment = model_path is not None and self.yolo.get_model_info(model_path).get('task') == 'segment'
+            self.w.predict_mask_opening_spinbox.setEnabled(is_segment)
+            self.w.predict_iou_thresh_spinbox.setEnabled(is_segment)
+            self.w.detailed_extraction_checkBox.setEnabled(is_segment)
 
 
     # Worker uncoupling functions
