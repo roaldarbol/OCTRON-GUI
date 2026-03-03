@@ -424,7 +424,7 @@ class sam2_octron_callbacks():
         if not image_indices:
             return
         
-        print(f'⚡️ Prefetching {len(image_indices)} images, skipping {skip_frames} frames | start: {current_frame}')
+        print(f'⚡️ Prefetching {len(image_indices)} images, skipping {skip_frames - 1} frames | start: {current_frame}')
         _ = predictor.images[image_indices]
         
         # Pre-compute backbone features so propagation only needs track_step.
