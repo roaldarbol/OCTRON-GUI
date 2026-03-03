@@ -435,6 +435,7 @@ class octron_widget(QWidget):
                                                         )
         self.predictor.is_initialized = False
         show_info(f"SAM2 model {model_name} loaded on {self.device}")
+        self.chunk_size = 15
         self._on_model_loaded(model_name)
 
     def load_sam3model(self, model_name=''):
@@ -470,6 +471,9 @@ class octron_widget(QWidget):
         )
         self.predictor.is_initialized = False
         show_info(f"SAM3 model {model_name} loaded on {self.device}")
+        # SAM3 semantic (Mode B) is much more expensive per frame due to
+        # the large number of tracked objects, so use a smaller batch.
+        self.chunk_size = 6 if semantic else 15
         self._on_model_loaded(model_name)
         
         # Disable "Points" option for SAM3 semantic+detector models
