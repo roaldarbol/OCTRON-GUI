@@ -473,15 +473,19 @@ class sam2_octron_callbacks():
         tracker = getattr(predictor, 'tracker', predictor)
         max_bb = getattr(tracker, '_max_cached_backbone_frames', 0)
         if (max_bb > 0
-                and hasattr(tracker, '_get_image_feature')
                 and hasattr(tracker, 'inference_state')
                 and tracker.inference_state):
             prefetch_indices = image_indices[:max_bb]
             t0 = time.perf_counter()
             import torch
-            with torch.inference_mode():
-                for idx in prefetch_indices:
-                    tracker._get_image_feature(tracker.inference_state, idx, batch_size=1)
+            # Use batched backbone when available (SAM3); fall back to
+            # per-frame computation for SAM2 or other predictors.
+            if hasattr(tracker, '_prefetch_backbone_batch'):
+                tracker._prefetch_backbone_batch(prefetch_indices, batch_size=4)
+            elif hasattr(tracker, '_get_image_feature'):
+                with torch.inference_mode():
+                    for idx in prefetch_indices:
+                        tracker._get_image_feature(tracker.inference_state, idx, batch_size=1)
             t1 = time.perf_counter()
             print(f'⚡️ Pre-computed backbone features for {len(prefetch_indices)} frames in {t1-t0:.2f}s')
 

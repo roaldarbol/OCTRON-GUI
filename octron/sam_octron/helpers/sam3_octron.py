@@ -90,7 +90,7 @@ class SAM3_octron:
         
         # How many non-conditioning frames to keep in memory per object.
         # Smaller = faster attention (fewer memory tokens) but less context.
-        self._max_memory_frames = 3
+        self._max_memory_frames = 2
         
         # Memory encoder stride: only run the memory encoder every N-th
         # propagated frame.  Frames without encoding still produce masks
@@ -168,7 +168,7 @@ class SAM3_octron:
             "non_cond_frame_outputs": set(),
         }
         # Tracking metadata
-        inference_state["frames_already_tracked"] = []
+        inference_state["frames_already_tracked"] = set()
         inference_state["tracking_has_started"] = False
         
         # OCTRON-specific: centroid & area tracking
@@ -231,6 +231,59 @@ class SAM3_octron:
             self.model._prepare_backbone_features(expanded_backbone_out, batch=batch_size)
         
         return image, expanded_backbone_out, vis_feats, vis_pos_embed, feat_sizes
+    
+    @torch.inference_mode()
+    def _prefetch_backbone_batch(self, frame_indices, batch_size=4):
+        """
+        Batch-compute backbone features for multiple frames at once.
+        
+        Processes *batch_size* frames per forward_image call, which
+        reduces per-frame GPU dispatch overhead and improves utilisation.
+        Already-cached frames are skipped automatically.
+        """
+        cached = self.inference_state["cached_features"]
+        uncached = [idx for idx in frame_indices if idx not in cached]
+        if not uncached:
+            return
+        
+        model_dtype = next(self.model.parameters()).dtype
+        max_cached = self._max_cached_backbone_frames
+        
+        for start in range(0, len(uncached), batch_size):
+            batch_indices = uncached[start : start + batch_size]
+            
+            # Load images from OctoZarr and stack into a single tensor
+            images = []
+            for idx in batch_indices:
+                img = self.inference_state["images"][idx]
+                if img.dim() == 3:
+                    img = img.unsqueeze(0)
+                images.append(img)
+            batch_tensor = torch.cat(images, dim=0).to(
+                device=self.device, dtype=model_dtype
+            )
+            
+            # Single batched backbone call
+            backbone_out = self.model.forward_image(batch_tensor)
+            
+            # Split per-frame and store in the LRU cache.
+            # .clone() makes each slice independent so the batch
+            # tensor can be freed after the loop iteration.
+            for i, idx in enumerate(batch_indices):
+                frame_backbone_out = {
+                    "backbone_fpn": [
+                        feat[i : i + 1].clone()
+                        for feat in backbone_out["backbone_fpn"]
+                    ],
+                    "vision_pos_enc": [
+                        pos[i : i + 1].clone()
+                        for pos in backbone_out["vision_pos_enc"]
+                    ],
+                }
+                cached[idx] = (batch_tensor[i : i + 1].clone(), frame_backbone_out)
+                if max_cached > 0:
+                    while len(cached) > max_cached:
+                        cached.popitem(last=False)
     
     
     # ── Single frame inference ────────────────────────────────────────────────
@@ -931,7 +984,7 @@ class SAM3_octron:
                 
                 # Combine per-object masks → (N, 1, H, W)
                 all_pred_masks = torch.cat(pred_masks_per_obj, dim=0)
-                self.inference_state["frames_already_tracked"].append(frame_idx)
+                self.inference_state["frames_already_tracked"].add(frame_idx)
                 _, video_res_masks = self._get_orig_video_res_output(all_pred_masks)
                 frame_count += 1
                 yield frame_idx, obj_ids, video_res_masks
@@ -948,6 +1001,13 @@ class SAM3_octron:
                   f"avg {avg_total:.0f}ms/frame "
                   f"(inference {avg_inf:.0f}ms, "
                   f"{avg_inf / batch_size:.0f}ms/object)")
+        
+        # Free GPU memory between batches to reduce fragmentation.
+        if self.device.type == "mps":
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+        elif self.device.type == "cuda":
+            torch.cuda.empty_cache()
     
     
     # ── State management ──────────────────────────────────────────────────────
