@@ -1153,9 +1153,8 @@ class YoloHandler(QObject):
             video_name = progress_info.get('video_name', '')
             if video_name:
                 lst = self.w.videos_for_prediction_list
-                # Find the video in the list and add checkmark
                 for i in range(lst.count()):
-                    if lst.itemText(i) == video_name:
+                    if lst.itemText(i).startswith(video_name):
                         lst.setItemText(i, f"{video_name} ✓")
                         break
             
@@ -1173,7 +1172,7 @@ class YoloHandler(QObject):
             if video_name:
                 lst = self.w.videos_for_prediction_list
                 for i in range(lst.count()):
-                    if lst.itemText(i) == video_name:
+                    if lst.itemText(i).startswith(video_name):
                         lst.setItemText(i, f"{video_name} (skipped)")
                         break
             self.w.predict_overall_progressbar.setMaximum(total_videos)
