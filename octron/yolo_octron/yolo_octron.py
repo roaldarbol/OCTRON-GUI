@@ -39,6 +39,7 @@ from octron.yolo_octron.helpers.polygons import (find_objects_in_mask,
 from octron.yolo_octron.helpers.yolo_zarr import (create_prediction_store, 
                                                   create_prediction_zarr
 )
+from octron.sam_octron.helpers.sam2_zarr import mark_frames_annotated
 from octron.tracking.helpers.tracker_checks import (load_boxmot_trackers, 
                                                     load_boxmot_tracker_config,
                                                     resolve_tracker,
@@ -2002,6 +2003,7 @@ class YOLO_octron:
                 frame_indices = sorted(mask_buffer.keys())
                 stacked_masks = np.stack([mask_buffer[idx] for idx in frame_indices])
                 mask_store[frame_indices,:,:] = stacked_masks
+                mark_frames_annotated(mask_store, frame_indices)
                     
                 # Clear buffer
                 mask_buffers[track_id].clear()
