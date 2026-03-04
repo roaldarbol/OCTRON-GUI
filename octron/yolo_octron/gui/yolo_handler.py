@@ -331,6 +331,9 @@ class YoloHandler(QObject):
                 print(f"Training data path '{self.yolo.data_path.as_posix()}' already exists. Using existing directory.")
                 return
 
+        # Disable the training groupbox while generating data
+        self.w.train_train_groupbox.setEnabled(False)
+        
         # Else ... continue the training data generation pipeline
         # Kick off polygon or bbox generation based on train mode
         if self.w.train_mode == 'detect':
@@ -594,8 +597,6 @@ class YoloHandler(QObject):
             self.yolo.write_yolo_config(train_mode=self.w.train_mode)
             # Enable next part (YOLO training) of the pipeline 
             self.w.train_train_groupbox.setEnabled(True)
-            self.w.launch_tensorboard_checkBox.setEnabled(True)
-            self.w.train_resume_checkBox.setEnabled(True)
             self.w.start_stop_training_btn.setStyleSheet('')
             self.w.start_stop_training_btn.setText(f'▷ Train')
 

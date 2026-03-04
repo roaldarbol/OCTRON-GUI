@@ -690,10 +690,15 @@ class octron_widget(QWidget):
             mark_frames_annotated(zarr_array, frame_set)
         self._pending_annotated_frames = {}
         
-        # Enable the predcition button again
+        # Enable the prediction button and UI sections again
         self.predict_next_batch_btn.setEnabled(True)
         self.predict_next_oneframe_btn.setEnabled(True)
         self.skip_frames_spinbox.setEnabled(True)
+        self.segmentation_bbox_decision_groupbox.setEnabled(True)
+        self.train_generate_groupbox.setEnabled(True)
+        self.train_train_groupbox.setEnabled(True)
+        self.predict_video_drop_groupbox.setEnabled(True)
+        self.predict_video_predict_groupbox.setEnabled(True)
         self.batch_predict_progressbar.setValue(0)
         
         # Save the object organizer 
@@ -802,10 +807,15 @@ class octron_widget(QWidget):
         # Identify the sender (button) that called this function
         sender = self.sender()
         
-        # Disable the prediction button
+        # Disable the prediction button and unrelated UI sections
         self.predict_next_batch_btn.setEnabled(False)
         self.predict_next_oneframe_btn.setEnabled(False)
         self.skip_frames_spinbox.setEnabled(False)
+        self.segmentation_bbox_decision_groupbox.setEnabled(False)
+        self.train_generate_groupbox.setEnabled(False)
+        self.train_train_groupbox.setEnabled(False)
+        self.predict_video_drop_groupbox.setEnabled(False)
+        self.predict_video_predict_groupbox.setEnabled(False)
         if sender == self.predict_next_batch_btn:
             self.prediction_worker = create_worker(self.octron_sam2_callbacks.batch_predict)
             self.prediction_worker.setAutoDelete(True)
