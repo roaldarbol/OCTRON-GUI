@@ -680,7 +680,11 @@ class SAM2_octron(SAM2VideoPredictor):
         # Convert binary mask (0/1) to logit scale for the SAM decoder.
         # The prompt encoder's mask convolutions expect logit-scale inputs
         # (matching previous-prediction logits), not raw binary values.
-        mask_inputs_for_decoder = mask_inputs * 20.0 - 10.0
+        # Use a soft scale so SAM treats the polygon as a rough hint and
+        # can reject background pixels that were accidentally enclosed.
+        # (Higher scale = SAM follows the mask more literally;
+        #  lower scale = SAM relies more on its own visual understanding.)
+        mask_inputs_for_decoder = mask_inputs * 6.0 - 3.0
         
         # If this frame hasn't been tracked before, we treat it as an initial conditioning
         # frame, meaning that the inputs points are to generate segments on this frame without
