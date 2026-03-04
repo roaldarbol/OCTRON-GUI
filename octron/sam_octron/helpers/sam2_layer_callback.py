@@ -238,6 +238,12 @@ class sam2_octron_callbacks():
         # box prompt often yields low-confidence results.  Passing the
         # actual category name (e.g. "fly", "screw") dramatically improves
         # single-box detection quality.
+        #
+        # However, if the label name is not a real word the text encoder
+        # recognises (e.g. "octo", abbreviations, project codes), the
+        # text embedding actually *hurts* — it pushes scores to near zero.
+        # We detect this by trying with text first; if the best score is
+        # very low we automatically fall back to box-only mode ("visual").
         text_prompt = organizer_entry.label  # e.g. "fly", "screw"
         
         # Always reset text embeddings before detection so that switching
@@ -264,14 +270,37 @@ class sam2_octron_callbacks():
                 show_error(f'Detection threshold {conf_threshold} out of range. Must be between 0 and 1.')
                 return None
         
-        # Run detection with text + ALL accumulated boxes together.
-        # The text tells the model WHAT to find; the boxes show WHERE.
+        # Run detection with text + box prompts.  If the label name
+        # produces a very weak response (max score < 0.25), the text
+        # encoder doesn't understand the word — retry without text so
+        # the detector relies purely on visual similarity from the boxes.
+        _TEXT_FALLBACK_THRESH = 0.25
         pred_masks, pred_scores, _ = predictor.detect(
             frame_idx=frame_idx,
             text=text_prompt,
             bboxes=all_boxes,
             conf_threshold=conf_threshold,
         )
+        
+        if pred_scores is not None and pred_scores.numel() > 0:
+            best_score = pred_scores.max().item()
+        else:
+            best_score = 0.0
+        
+        if best_score < _TEXT_FALLBACK_THRESH:
+            # Text prompt isn't helping — fall back to box-only ("visual")
+            print(f'  ↳ Text "{text_prompt}" produced low scores (max {best_score:.3f}), '
+                  f'retrying with box-only mode...')
+            if hasattr(predictor, 'detector'):
+                if hasattr(predictor.detector, 'text_embeddings'):
+                    predictor.detector.text_embeddings = {}
+                if hasattr(predictor.detector, 'names'):
+                    predictor.detector.names = []
+            pred_masks, pred_scores, _ = predictor.detect(
+                frame_idx=frame_idx,
+                bboxes=all_boxes,
+                conf_threshold=conf_threshold,
+            )
         
         if pred_masks is None or pred_masks.shape[0] == 0:
             show_warning('SAM3 Mode B: No objects detected.')
