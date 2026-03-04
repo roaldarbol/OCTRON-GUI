@@ -59,6 +59,9 @@ class SAM3_octron:
     ):
         self.model = model
         self.device = device
+        # Force the SAM decoder to actually run on mask-only inputs
+        # (the default True causes mask inputs to be returned unchanged).
+        self.model.use_mask_input_as_output_without_sam = False
         self.inference_state = {}
         
         # Model geometry
@@ -412,8 +415,8 @@ class SAM3_octron:
             return obj_idx
         else:
             print(f"⚠️ Cannot add a new label (id={obj_id}) after batch prediction has already run.")
-            print(f"  ℹ️ You can only annotate existing labels: {self.inference_state['obj_ids']}")
-            print(f"  ➡️ To add additional labels, reset the predictor first (click 'Reset').")
+            print(f"You can only annotate existing labels: {self.inference_state['obj_ids']}")
+            print(f"To add additional labels, reset the predictor first (click 'Reset').")
             return None
     
     def _get_obj_num(self):
@@ -842,6 +845,11 @@ class SAM3_octron:
         mask_inputs_per_frame[frame_idx] = mask_inputs
         point_inputs_per_frame.pop(frame_idx, None)
         
+        # Convert binary mask (0/1) to logit scale for the SAM decoder.
+        # The prompt encoder's mask convolutions expect logit-scale inputs
+        # (matching previous-prediction logits), not raw binary values.
+        mask_inputs_for_decoder = mask_inputs * 20.0 - 10.0
+        
         is_init_cond_frame = frame_idx not in self.inference_state.get("frames_already_tracked", [])
         if is_init_cond_frame:
             reverse = False
@@ -859,7 +867,7 @@ class SAM3_octron:
             batch_size=1,
             is_init_cond_frame=is_init_cond_frame,
             point_inputs=None,
-            mask_inputs=mask_inputs,
+            mask_inputs=mask_inputs_for_decoder,
             reverse=reverse,
             run_mem_encoder=False,
         )

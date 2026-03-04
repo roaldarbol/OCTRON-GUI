@@ -124,27 +124,33 @@ class sam2_octron_callbacks():
                 
             else:
                 # In all other cases, just treat shapes as masks 
-                shape_masks = np.stack(shapes_layer.to_masks((video_height, video_width)))
-                if len(shape_masks) == 1: 
-                    shape_mask = shape_masks[0]
-                else:
-                    frame_indices = np.array([s[0][0] for s in shapes_layer.data]).astype(int)
-                    valid_indices = np.argwhere(frame_indices == frame_idx)
-                    valid_masks = shape_masks[valid_indices].squeeze()
-                    if valid_masks.ndim == 3:
-                        shape_mask = np.sum(valid_masks, axis=0)
+                try:
+                    shape_masks = np.stack(shapes_layer.to_masks((video_height, video_width)))
+                    if len(shape_masks) == 1: 
+                        shape_mask = shape_masks[0]
                     else:
-                        shape_mask = valid_masks
-                shape_mask[shape_mask > 0] = 1
-                shape_mask = shape_mask.astype(np.uint8)
-            
-                label = 1 # Always positive for now
-                mask = run_new_pred(predictor=predictor,
-                                    frame_idx=frame_idx,
-                                    obj_id=obj_id,
-                                    labels=label,
-                                    masks=shape_mask,
-                                    )
+                        frame_indices = np.array([s[0][0] for s in shapes_layer.data]).astype(int)
+                        valid_indices = np.argwhere(frame_indices == frame_idx)
+                        valid_masks = shape_masks[valid_indices].squeeze()
+                        if valid_masks.ndim == 3:
+                            shape_mask = np.sum(valid_masks, axis=0)
+                        else:
+                            shape_mask = valid_masks
+                    shape_mask[shape_mask > 0] = 1
+                    shape_mask = shape_mask.astype(np.uint8)
+                
+                    label = 1 # Always positive for now
+                    mask = run_new_pred(predictor=predictor,
+                                        frame_idx=frame_idx,
+                                        obj_id=obj_id,
+                                        labels=label,
+                                        masks=shape_mask,
+                                        )
+                except Exception as e:
+                    import traceback
+                    print(f'❌ Error processing shape mask: {e}')
+                    traceback.print_exc()
+                    return
             if mask is not None:
                 # mask can be None,
                 # when new objects are added after tracking starts 

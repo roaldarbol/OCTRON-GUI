@@ -153,7 +153,7 @@ def add_sam2_shapes_layer(
                                  ndim=3,
                                  name=name, 
                                  scale=(1,1),
-                                 edge_width=1,
+                                 edge_width=4,
                                  edge_color=color,
                                  face_color=[1,1,1,0],
                                  opacity=.4,

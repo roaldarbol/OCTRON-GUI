@@ -676,6 +676,12 @@ class SAM2_octron(SAM2VideoPredictor):
 
         mask_inputs_per_frame[frame_idx] = mask_inputs
         point_inputs_per_frame.pop(frame_idx, None)
+        
+        # Convert binary mask (0/1) to logit scale for the SAM decoder.
+        # The prompt encoder's mask convolutions expect logit-scale inputs
+        # (matching previous-prediction logits), not raw binary values.
+        mask_inputs_for_decoder = mask_inputs * 20.0 - 10.0
+        
         # If this frame hasn't been tracked before, we treat it as an initial conditioning
         # frame, meaning that the inputs points are to generate segments on this frame without
         # using any memory from other frames, like in SAM. Otherwise (if it has been tracked),
@@ -700,7 +706,7 @@ class SAM2_octron(SAM2VideoPredictor):
             batch_size=1,  # run on the slice of a single object
             is_init_cond_frame=is_init_cond_frame,
             point_inputs=None,
-            mask_inputs=mask_inputs,
+            mask_inputs=mask_inputs_for_decoder,
             reverse=reverse,
             # Skip the memory encoder when adding clicks or mask. We execute the memory encoder
             # at the beginning of `propagate_in_video` (after user finalize their clicks). This
