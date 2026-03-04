@@ -1043,6 +1043,11 @@ class YoloHandler(QObject):
         self.iou_thresh = float(self.w.predict_iou_thresh_spinbox.value())
         self.skip_frames = self.w.skip_frames_analysis_spinBox.value()
         
+        # Reset any status suffixes on video names from a previous run
+        lst = self.w.videos_for_prediction_list
+        for i in range(2, lst.count()):  # skip header (0) and remove action (1)
+            lst.setItemText(i, lst.itemText(i).split(' (')[0].split(' ✓')[0])
+        
         # Deactivate the training data generation box 
         self.w.segmentation_bbox_decision_groupbox.setEnabled(False)
         self.w.train_generate_groupbox.setEnabled(False)
