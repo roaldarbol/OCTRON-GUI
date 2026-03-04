@@ -1905,28 +1905,11 @@ class YOLO_octron:
         # Process each video
         for video_index, (video_name, video_dict) in enumerate(videos_dict.items(), start=0):
             num_frames = video_dict['num_frames_analyzed']
-            # Load model anew for every video since the tracker persists
-            try:
-                model = self.load_model(model_name_path=model_path)
-                if not model:
-                    print(f"Failed to load model from {model_path}")
-                    return
-            except Exception as e:
-                print(f"Error during initialization: {e}")
-                return    
-
+            
             print(f'\nProcessing video {video_index+1}/{total_videos}: {video_name}')
             video_path = Path(video_dict['video_file_path'])
             
-            # DEPRECATED
-            # if max(video_dict['height'], video_dict['width']) < imgsz:
-            #     print(f"⚠ Video resolution is smaller than the model image size ({imgsz}). Setting retina_masks to False.")
-            #     retina_masks = False
-            # else:
-            #     retina_masks = True
-            retina_masks = True if is_segment else False
-            
-            # Set up prediction directory structure
+            # Check overwrite BEFORE loading the model to avoid unnecessary work
             save_dir = video_path.parent / 'octron_predictions' / f"{video_path.stem}_{tracker_name}"
             if save_dir.exists() and overwrite:
                 shutil.rmtree(save_dir)
@@ -1940,6 +1923,25 @@ class YOLO_octron:
                     'save_dir': save_dir,
                 }
                 continue
+            
+            # Load model anew for every video since the tracker persists
+            try:
+                model = self.load_model(model_name_path=model_path)
+                if not model:
+                    print(f"Failed to load model from {model_path}")
+                    return
+            except Exception as e:
+                print(f"Error during initialization: {e}")
+                return    
+
+            # DEPRECATED
+            # if max(video_dict['height'], video_dict['width']) < imgsz:
+            #     print(f"⚠ Video resolution is smaller than the model image size ({imgsz}). Setting retina_masks to False.")
+            #     retina_masks = False
+            # else:
+            #     retina_masks = True
+            retina_masks = True if is_segment else False
+            
             save_dir.mkdir(parents=True, exist_ok=True)
             
             # Set up boxmot tracker 

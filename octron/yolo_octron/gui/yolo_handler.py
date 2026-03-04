@@ -1074,6 +1074,7 @@ class YoloHandler(QObject):
         self.yolo_prediction_worker = create_worker(self._yolo_predictor)
         self.yolo_prediction_worker.setAutoDelete(True) # auto destruct!
         self.yolo_prediction_worker.yielded.connect(self._update_prediction_progress)
+        self.yolo_prediction_worker.finished.connect(self._on_yolo_prediction_finished)
         self.w.predict_overall_progressbar.setEnabled(True)  
         self.w.predict_current_video_progressbar.setEnabled(True)   
         self.w.predict_current_videoname_label.setEnabled(True)
@@ -1164,42 +1165,60 @@ class YoloHandler(QObject):
                 for label, track_id, _, _, _, _  in self.yolo.load_predictions(save_dir=save_dir):
                     print(f"Adding tracking result to viewer | Label: {label}, Track ID: {track_id}")
             
+        elif stage == 'skipped_video':
+            # Video was skipped (output folder already exists, overwrite=False)
+            video_name = progress_info.get('video_name', '')
+            video_index = progress_info.get('video_index', 0)
+            total_videos = progress_info.get('total_videos', 1)
+            if video_name:
+                lst = self.w.videos_for_prediction_list
+                for i in range(lst.count()):
+                    if lst.itemText(i) == video_name:
+                        lst.setItemText(i, f"{video_name} (skipped)")
+                        break
+            self.w.predict_overall_progressbar.setMaximum(total_videos)
+            self.w.predict_overall_progressbar.setValue(video_index + 1)
+            
         elif stage == 'complete':
-            self.yolo_prediction_worker.quit()
-            # Reset video progress bar for next video
+            # Reset progress bars (UI re-enabling is handled by _on_yolo_prediction_finished)
             self.w.predict_current_video_progressbar.setValue(0)
             self.w.predict_overall_progressbar.setValue(0)
             self.w.predict_current_video_progressbar.setEnabled(False)
             self.w.predict_overall_progressbar.setEnabled(False)
-            
             self.w.predict_current_videoname_label.setText('')
             self.w.predict_finish_time_label.setText('')
             self.w.predict_current_videoname_label.setEnabled(False)
             self.w.predict_finish_time_label.setEnabled(False)
-            
-            # Re-enable UI elements
-            self.w.predict_start_btn.setStyleSheet('')
-            self.w.predict_start_btn.setText('▷ Predict')
-            self.w.predict_start_btn.setEnabled(True)
-            self.w.main_toolbox.widget(1).setEnabled(True)  # Re-enable Annotation tab
-            self.w.main_toolbox.widget(2).setEnabled(True)  # Re-enable Training tab
-            self.w.predict_video_drop_groupbox.setEnabled(True)
-            self.w.yolomodel_trained_list.setEnabled(True)
-            self.w.yolomodel_tracker_list.setEnabled(True)
-            self.w.tune_tracker_btn.setEnabled(True)
-            self.w.open_when_finish_checkBox.setEnabled(True)
-            self.w.single_subject_checkBox.setEnabled(True)
-            self.w.overwrite_prediction_checkBox.setEnabled(True)
-            self.w.predict_conf_thresh_spinbox.setEnabled(True)
-            self.w.skip_frames_analysis_spinBox.setEnabled(True)
-            # Only re-enable mask-related controls if the selected model is a segmentation model
-            model_name = self.w.yolomodel_trained_list.currentText()
-            model_path = self.trained_models.get(model_name)
-            is_segment = model_path is not None and self.yolo.get_model_info(model_path).get('task') == 'segment'
-            self.w.predict_mask_opening_spinbox.setEnabled(is_segment)
-            self.w.predict_iou_thresh_spinbox.setEnabled(is_segment)
-            self.w.detailed_extraction_checkBox.setEnabled(is_segment)
 
+
+    def _on_yolo_prediction_finished(self):
+        """
+        Connected to the worker's `finished` signal.
+        Always re-enables the prediction UI, regardless of how the worker ended
+        (normal completion, all videos skipped, or early exit due to error).
+        """
+        # Re-enable UI elements
+        self.w.predict_start_btn.setStyleSheet('')
+        self.w.predict_start_btn.setText('▷ Predict')
+        self.w.predict_start_btn.setEnabled(True)
+        self.w.main_toolbox.widget(1).setEnabled(True)  # Annotation tab
+        self.w.main_toolbox.widget(2).setEnabled(True)  # Training tab
+        self.w.predict_video_drop_groupbox.setEnabled(True)
+        self.w.yolomodel_trained_list.setEnabled(True)
+        self.w.yolomodel_tracker_list.setEnabled(True)
+        self.w.tune_tracker_btn.setEnabled(True)
+        self.w.open_when_finish_checkBox.setEnabled(True)
+        self.w.single_subject_checkBox.setEnabled(True)
+        self.w.overwrite_prediction_checkBox.setEnabled(True)
+        self.w.predict_conf_thresh_spinbox.setEnabled(True)
+        self.w.skip_frames_analysis_spinBox.setEnabled(True)
+        # Only re-enable mask-related controls if the selected model is a segmentation model
+        model_name = self.w.yolomodel_trained_list.currentText()
+        model_path = self.trained_models.get(model_name)
+        is_segment = model_path is not None and self.yolo.get_model_info(model_path).get('task') == 'segment'
+        self.w.predict_mask_opening_spinbox.setEnabled(is_segment)
+        self.w.predict_iou_thresh_spinbox.setEnabled(is_segment)
+        self.w.detailed_extraction_checkBox.setEnabled(is_segment)
 
     # Worker uncoupling functions
     def _uncouple_worker_polygons(self):
