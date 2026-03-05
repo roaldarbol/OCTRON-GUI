@@ -16,7 +16,7 @@ from qtpy.QtCore import Qt
 from octron.yolo_octron.constants import ALL_REGION_PROPERTIES, DEFAULT_REGION_PROPERTIES
 
 # Hardcoded original defaults (used by "Reset Defaults" button).
-_ORIGINAL_DEFAULTS = ('area', 'eccentricity', 'solidity', 'orientation')
+_ORIGINAL_DEFAULTS = ('area',)
 
 
 class RegionPropertiesDialog(QDialog):
