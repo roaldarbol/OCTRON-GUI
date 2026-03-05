@@ -28,7 +28,6 @@ requires-python = ">=3.11,<3.12"
 dependencies = [
     "napari==0.7.0a3",
     "numpy<=2.1.1",
-    "PyQt5>=5.15.11",
     "qtpy>=2.4.3",
     "torch>=2.5.1",
     "torchvision>=0.20.1",
@@ -55,11 +54,16 @@ dependencies = [
     "clip @ git+https://github.com/ultralytics/CLIP.git"
 ]
 
+[project.optional-dependencies]
+pyqt5 = ["PyQt5>=5.15.11"]
+pyqt6 = ["PyQt6>=6.7.0"]
+all = ["napari[all]==0.7.0a3"]
+
 [project.urls]
-Homepage = "https://github.com/horsto/octron"
-Repository = "https://github.com/horsto/octron.git"
-Issues = "https://github.com/horsto/octron/issues"
-Changelog = "https://github.com/horsto/octron/blob/master/CHANGELOG.md"
+Homepage = "https://github.com/OCTRON-tracking/OCTRON-GUI"
+Repository = "https://github.com/OCTRON-tracking/OCTRON-GUI.git"
+Issues = "https://github.com/OCTRON-tracking/OCTRON-GUI/issues"
+Changelog = "https://github.com/OCTRON-tracking/OCTRON-GUI/blob/master/CHANGELOG.md"
 
 [project.entry-points."napari.manifest"]
 octron = "octron:napari.yaml"
