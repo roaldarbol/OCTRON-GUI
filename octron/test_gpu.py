@@ -24,6 +24,16 @@ def auto_device() -> str:
     return 'cpu'
 
 
+
+def auto_device() -> str:
+    """Return 'cuda', 'mps', or 'cpu' depending on what's available."""
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
 def check_gpu_access():
     setup_logging()
     print_welcome()
