@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh api:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:sleap-io.readthedocs.io)",
+      "Bash(git -C c:/Users/Admin/Projects/OCTRON-GUI diff main -- octron/tools/render.py)",
+      "Bash(.venv/Scripts/python -c \"from zarr.codecs import BloscCodec, BloscShuffle; help\\(BloscCodec.__init__\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''octron/yolo_octron/yolo_octron.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
+      "Bash(uv run:*)",
+      "Bash(python -c \"from octron.cli import app; print\\(''OK''\\)\")"
+    ]
+  }
+}
