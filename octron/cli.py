@@ -75,7 +75,7 @@ def train(
 
 
 @app.command()
-def analyze(
+def predict(
     videos: List[Path] = typer.Argument(..., help='One or more video file paths.'),
     model_path: Path = typer.Option(..., '--model', help='Path to a trained YOLO .pt file.'),
     device: str = typer.Option('auto', help="Device to run inference on ('auto', 'cpu', 'cuda', 'mps')."),
@@ -89,7 +89,7 @@ def analyze(
     buffer_size: int = typer.Option(500, help='Frame buffer size before writing to zarr.'),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
-    from octron.analyze import run_analysis
+    from octron.predict import run_predict
     from octron.test_gpu import auto_device
     if device == 'auto':
         device = auto_device()
@@ -99,7 +99,7 @@ def analyze(
         tracker_cfg_path = Path(tracker)
     else:
         tracker_name = tracker
-    run_analysis(
+    run_predict(
         videos=videos,
         model_path=model_path,
         device=device,
