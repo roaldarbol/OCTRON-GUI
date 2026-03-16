@@ -8,7 +8,7 @@ Subcommands
   gui         Launch the OCTRON napari GUI
   gpu-test    Check GPU availability
   train       Run the full YOLO training pipeline on an OCTRON project
-  analyze     Run YOLO prediction and tracking on one or more videos
+  predict     Run YOLO prediction and tracking on one or more videos
   render      Render annotated video(s) from prediction output
   bbox-sizes  Report bounding-box sizes to inform --tracklet-size choice
 """
