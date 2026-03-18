@@ -23,6 +23,7 @@ def run_predict(
     opening_radius=0,
     overwrite=True,
     buffer_size=500,
+    infer_batch_size=8,
 ):
     """
     Run YOLO prediction and tracking on one or more videos.
@@ -85,6 +86,7 @@ def run_predict(
         opening_radius=opening_radius,
         overwrite=overwrite,
         buffer_size=buffer_size,
+        infer_batch_size=infer_batch_size,
     ):
         stage = progress.get("stage", "")
         video = progress.get("video_name", "")
