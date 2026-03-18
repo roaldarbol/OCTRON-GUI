@@ -145,7 +145,7 @@ def predict(
     ),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing prediction results. Default: skip videos that already have predictions."),
     buffer_size: int = typer.Option(
-        500, help="Frame buffer size before writing to zarr."
+        200, help="Frames buffered per track before flushing to zarr (also sets the zarr chunk size). Larger values mean fewer, better-compressed writes. Each in-flight write holds buffer_size × H × W bytes; lower this if hitting memory limits."
     ),
     infer_batch_size: int = typer.Option(
         8, "--infer-batch-size", help="Number of frames per inference batch. Larger values increase GPU utilisation."

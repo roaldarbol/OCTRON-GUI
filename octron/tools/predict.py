@@ -23,7 +23,7 @@ def run_predict(
     conf_thresh=0.5,
     opening_radius=0,
     overwrite=False,
-    buffer_size=500,
+    buffer_size=200,
     infer_batch_size=8,
 ):
     """
@@ -118,7 +118,7 @@ def run_predict(
         print(
             f"  [{stage}] video {vidx}/{total_v} ({video}): "
             f"frame {frame}/{total_f} | {pct:.1f}% | {fps:.1f} fps | ETA: {eta_str}",
-            end="\r",
+            end="\r\033[K",
         )
     print()
     elapsed = time.time() - _wall_start

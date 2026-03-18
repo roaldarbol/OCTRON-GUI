@@ -1712,7 +1712,7 @@ class YOLO_octron:
                   conf_thresh=.5,
                   opening_radius=0,
                   overwrite=False,
-                  buffer_size=500,
+                  buffer_size=200,
                   infer_batch_size=8,
                   ):
         """
@@ -1997,31 +1997,55 @@ class YOLO_octron:
             video_prediction_start = time.time()
             all_ids = []
             
-            # Initialize buffer structures for masks (segmentation only)
-            mask_buffers = {}  # track_id -> {frame_idx: mask}
-            buffer_counts = {}  # track_id -> count
-            mask_stores = {}   # track_id -> zarr array
+            # Initialize buffer structures for masks (segmentation only).
+            # Each track gets a single pre-allocated (buffer_size, H, W) int8 array that is
+            # reused across flushes — no np.stack copy, constant memory per track.
+            mask_buffer_arrays = {}     # track_id -> np.ndarray(buffer_size, H, W)
+            mask_buffer_fills = {}      # track_id -> int  (frames written into current array)
+            mask_buffer_frame_idxs = {} # track_id -> list[int]  (video frame indices, for zarr)
+            mask_buffer_frame_map = {}  # track_id -> {frame_idx: slot}  (for iou_thresh<0.01 lookup)
+            mask_stores = {}            # track_id -> zarr array
 
-            # Thread pool for async zarr writes — disk I/O runs in parallel with GPU inference
+            # Thread pool for async zarr writes — disk I/O runs in parallel with GPU inference.
+            # _flush_semaphore limits how many write tasks may be in-flight (queued + running)
+            # at once.  Each pending task holds a (buffer_size × H × W) data copy in RAM;
+            # without backpressure the queue can grow to hundreds of entries → OOM.
+            _FLUSH_MAX_INFLIGHT = 8
             _flush_pool = ThreadPoolExecutor(max_workers=4)
             _flush_futures = []
+            _flush_semaphore = threading.Semaphore(_FLUSH_MAX_INFLIGHT)
 
-            def _write_to_zarr(mask_store, frame_indices, stacked_masks):
-                """Background task: write stacked masks to zarr and update annotated-frames attr."""
-                mask_store[frame_indices, :, :] = stacked_masks
-                mark_frames_annotated(mask_store, frame_indices)
-                print(f"  [zarr] wrote {len(frame_indices)} frames")
+            def _write_to_zarr(semaphore, mask_store, frame_indices, data):
+                """Background task: write mask data to zarr and release semaphore slot.
+                NOTE: mark_frames_annotated is intentionally NOT called here — the attrs
+                are written once per track at the end of the video instead, avoiding
+                repeated read-modify-sort-write of a growing JSON list on every flush."""
+                try:
+                    mask_store[frame_indices, :, :] = data
+                finally:
+                    semaphore.release()
 
             def _flush_mask_buffer(track_id):
-                """Snapshot buffer, clear it immediately, then submit the zarr write asynchronously."""
-                if track_id not in buffer_counts or buffer_counts[track_id] == 0:
+                """Copy filled slice, release pre-alloc array, submit write with backpressure."""
+                n = mask_buffer_fills.get(track_id, 0)
+                if n == 0:
                     return
-                frame_indices = sorted(mask_buffers[track_id].keys())
-                stacked_masks = np.stack([mask_buffers[track_id][i] for i in frame_indices])
-                # Clear now so new frames accumulate while the write runs in the background
-                mask_buffers[track_id] = {}
-                buffer_counts[track_id] = 0
-                future = _flush_pool.submit(_write_to_zarr, mask_stores[track_id], frame_indices, stacked_masks)
+                frame_indices = mask_buffer_frame_idxs[track_id][:n]
+                # .copy() on just the filled slice — avoids holding the full pre-allocated array
+                data = mask_buffer_arrays[track_id][:n].copy()
+                # Free the pre-allocated array immediately; re-allocated lazily on next detection.
+                del mask_buffer_arrays[track_id]
+                # Reset immediately so new frames accumulate while the write runs
+                mask_buffer_fills[track_id] = 0
+                mask_buffer_frame_idxs[track_id] = []
+                mask_buffer_frame_map[track_id] = {}
+                # Block if too many writes are already queued — deliberate backpressure that
+                # prevents unlimited accumulation of (buffer_size × H × W) arrays in the queue.
+                _flush_semaphore.acquire()
+                future = _flush_pool.submit(
+                    _write_to_zarr, _flush_semaphore,
+                    mask_stores[track_id], frame_indices, data,
+                )
                 _flush_futures.append(future)
             
             # Pipelined batched inference:
@@ -2046,7 +2070,12 @@ class YOLO_octron:
             )
             decode_thread.start()
 
+            _batch_count = 0
             while True:
+                # Wall-clock start for this batch — covers decode wait, inference,
+                # per-frame tracking, and any semaphore stalls during zarr flushing.
+                batch_t = time.time()
+
                 # Drain up to infer_batch_size items from the decode queue
                 pending = []
                 _done = False
@@ -2061,7 +2090,6 @@ class YOLO_octron:
                     break
 
                 # Run batched inference on all frames in the chunk at once
-                batch_t = time.time()
                 results_list = model.predict(
                     source=[p[2] for p in pending],
                     task=model_task,
@@ -2080,20 +2108,10 @@ class YOLO_octron:
                     save_txt=False,
                     save_conf=False,
                 )
-                frame_time_each = (time.time() - batch_t) / len(pending)
 
                 # Feed results to the tracker sequentially (tracker is stateful per-frame)
                 for (frame_no, frame_idx, frame), result in zip(pending, results_list):
-                    yield {
-                        'stage': 'processing',
-                        'video_name': video_name,
-                        'video_index': video_index,
-                        'total_videos': total_videos,
-                        'frame': frame_no + 1,
-                        'total_frames': num_frames,
-                        'frame_time': frame_time_each,
-                    }
-                    # Then process the results ...
+                    # Process the results first ...
                     try:
                         confidences = result.boxes.conf.cpu().numpy()
                         classes = result.boxes.cls.cpu().numpy()
@@ -2183,15 +2201,18 @@ class YOLO_octron:
                                 mask_store = create_prediction_zarr(prediction_store,
                                                 f'{track_id}_masks',
                                                 shape=video_shape,
-                                                chunk_size=500,
+                                                chunk_size=buffer_size,
                                                 fill_value=-1,
                                                 dtype='int8',
                                                 video_hash=''
                                                 )
                                 mask_store.attrs['label'] = label
                                 mask_store.attrs['classes'] = result.names
-                                mask_buffers[track_id] = {}
-                                buffer_counts[track_id] = 0
+                                H, W = video_dict['height'], video_dict['width']
+                                mask_buffer_arrays[track_id] = np.empty((buffer_size, H, W), dtype='int8')
+                                mask_buffer_fills[track_id] = 0
+                                mask_buffer_frame_idxs[track_id] = []
+                                mask_buffer_frame_map[track_id] = {}
                                 mask_stores[track_id] = mask_store
 
                             # Initialize row accumulation for this track
@@ -2233,17 +2254,24 @@ class YOLO_octron:
                             mask = postprocess_mask(mask, opening_radius=opening_radius)
                             if iou_thresh < 0.01:
                                 # Fuse this mask with prior mask (if any) from buffer or zarr
-                                if frame_idx in mask_buffers[track_id]:
-                                    previous_mask = mask_buffers[track_id][frame_idx].copy()
+                                slot = mask_buffer_frame_map[track_id].get(frame_idx)
+                                if slot is not None:
+                                    previous_mask = mask_buffer_arrays[track_id][slot].copy()
                                 else:
                                     previous_mask = mask_store[frame_idx,:,:].copy()
                                     previous_mask[previous_mask == -1] = 0
                                 mask = np.logical_or(previous_mask, mask)
                                 mask = mask.astype('int8')
-                            # Add to buffer instead of writing directly
-                            mask_buffers[track_id][frame_idx] = mask
-                            buffer_counts[track_id] = buffer_counts.get(track_id, 0) + 1
-                            if buffer_counts[track_id] >= buffer_size:
+                            # Write into the pre-allocated buffer slot (re-allocate lazily if freed after last flush)
+                            if track_id not in mask_buffer_arrays:
+                                H_buf, W_buf = video_dict['height'], video_dict['width']
+                                mask_buffer_arrays[track_id] = np.empty((buffer_size, H_buf, W_buf), dtype='int8')
+                            slot = mask_buffer_fills[track_id]
+                            mask_buffer_arrays[track_id][slot] = mask
+                            mask_buffer_frame_idxs[track_id].append(frame_idx)
+                            mask_buffer_frame_map[track_id][frame_idx] = slot
+                            mask_buffer_fills[track_id] = slot + 1
+                            if mask_buffer_fills[track_id] >= buffer_size:
                                 _flush_mask_buffer(track_id)
 
                         # Accumulate tracking data as a plain dict — zero pandas overhead in hot loop.
@@ -2308,6 +2336,34 @@ class YOLO_octron:
 
                     # A FRAME IS COMPLETE
 
+                # Wall time for this entire batch (decode + inference + tracking + any flush stalls)
+                # divided evenly across the frames — this is what we report as frame_time so
+                # the ETA accounts for zarr backpressure, not just raw GPU inference speed.
+                _batch_wall = (time.time() - batch_t) / len(pending)
+                for frame_no, _, _ in pending:
+                    yield {
+                        'stage': 'processing',
+                        'video_name': video_name,
+                        'video_index': video_index,
+                        'total_videos': total_videos,
+                        'frame': frame_no + 1,
+                        'total_frames': num_frames,
+                        'frame_time': _batch_wall,
+                    }
+
+                # Release YOLO result objects (which hold full-resolution mask tensors) and
+                # the decoded frame batch promptly — don't wait for the next loop iteration.
+                del results_list, pending
+
+                # Prune completed zarr-write futures so the list stays small
+                if _flush_futures:
+                    _flush_futures[:] = [f for f in _flush_futures if not f.done()]
+
+                # Periodically run GC to return freed numpy/tensor memory to the allocator
+                _batch_count += 1
+                if _batch_count % 100 == 0:
+                    gc.collect()
+
                 if _done:
                     break
 
@@ -2321,6 +2377,11 @@ class YOLO_octron:
                 for fut in _flush_futures:
                     fut.result()
                 _flush_pool.shutdown(wait=False)
+                # Write annotated_frames attr once per track — doing this after all writes avoids
+                # repeated read-modify-sort-write of a growing JSON list on every hot-path flush.
+                for track_id in all_ids:
+                    written_idxs = sorted({frame_idx for (_, frame_idx) in tracking_rows_dict[track_id].keys()})
+                    mark_frames_annotated(mask_stores[track_id], written_idxs)
                 
             # Build DataFrames from accumulated row dicts (one allocation per track per video)
             import pandas as pd
