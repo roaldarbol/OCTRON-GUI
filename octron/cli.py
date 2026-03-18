@@ -259,6 +259,9 @@ def render(
     tracklet_smooth_order: int = typer.Option(
         4, "--tracklet-smooth-order", help="Butterworth filter order (higher = steeper rolloff).",
     ),
+    tracklet_min_frames: int = typer.Option(
+        0, "--tracklet-min-frames", help="Skip tracks with fewer than this many frames. 0 = keep all tracks.",
+    ),
     bbox_sizes: bool = typer.Option(
         False, "--bbox-sizes",
         help="Report per-track bounding-box sizes to help choose --tracklet-size, then exit.",
@@ -303,6 +306,7 @@ def render(
         tracklet_mask_centroids=tracklet_mask_centroids,
         tracklet_smooth_cutoff_hz=tracklet_smooth_cutoff_hz,
         tracklet_smooth_order=tracklet_smooth_order,
+        tracklet_min_frames=tracklet_min_frames,
     )
 
 
