@@ -2074,47 +2074,42 @@ class YOLO_octron:
             )
             decode_thread.start()
 
+            # Always keep the raw frame: boxmot validates img is np.ndarray even for
+            # IoU-only trackers (ByteTrack), and region_details needs it too.
+            _needs_frame = True
+
+            from octron.yolo_octron.helpers.pipelined_predict import (
+                run_inference_worker,
+                INFER_DONE as _INFER_DONE,
+            )
+            results_queue = queue.Queue(maxsize=infer_batch_size * 4)
+            inference_thread = threading.Thread(
+                target=run_inference_worker,
+                args=(
+                    frame_queue, results_queue, _DECODE_DONE,
+                    model, model_task, save_dir, rect, imgsz,
+                    conf_thresh, iou_thresh, device, retina_masks,
+                    infer_batch_size, _needs_frame,
+                ),
+                daemon=True,
+            )
+            inference_thread.start()
+
             _batch_count = 0
             while True:
-                # Wall-clock start for this batch — covers decode wait, inference,
-                # per-frame tracking, and any semaphore stalls during zarr flushing.
-                batch_t = time.time()
-
-                # Drain up to infer_batch_size items from the decode queue
-                pending = []
-                _done = False
-                for _ in range(infer_batch_size):
-                    item = frame_queue.get()
-                    if item is _DECODE_DONE:
-                        _done = True
-                        break
-                    pending.append(item)
-
-                if not pending:
+                item = results_queue.get()
+                if isinstance(item, Exception):
+                    raise item
+                if item is _INFER_DONE:
                     break
 
-                # Run batched inference on all frames in the chunk at once
-                results_list = model.predict(
-                    source=[p[2] for p in pending],
-                    task=model_task,
-                    project=save_dir.parent.as_posix(),
-                    name=save_dir.name,
-                    show=False,
-                    rect=rect,
-                    save=False,
-                    verbose=False,
-                    imgsz=imgsz,
-                    max_det=100,
-                    conf=conf_thresh,
-                    iou=iou_thresh,
-                    device=device,
-                    retina_masks=retina_masks,
-                    save_txt=False,
-                    save_conf=False,
-                )
+                frame_no, frame_idx, frame, result = item
+                _t_frame = time.time()
 
-                # Feed results to the tracker sequentially (tracker is stateful per-frame)
-                for (frame_no, frame_idx, frame), result in zip(pending, results_list):
+                # Feed results to the tracker sequentially (tracker is stateful per-frame).
+                # try/finally ensures every frame is reported in the progress bar, even when
+                # a frame has no detections or no confirmed tracks (continue exits the try).
+                try:
                     # Process the results first ...
                     try:
                         confidences = result.boxes.conf.cpu().numpy()
@@ -2340,11 +2335,10 @@ class YOLO_octron:
 
                     # A FRAME IS COMPLETE
 
-                # Wall time for this entire batch (decode + inference + tracking + any flush stalls)
-                # divided evenly across the frames — this is what we report as frame_time so
-                # the ETA accounts for zarr backpressure, not just raw GPU inference speed.
-                _batch_wall = (time.time() - batch_t) / len(pending)
-                for frame_no, _, _ in pending:
+                finally:
+                    # Always fires — even when a frame had no detections (continue above).
+                    # This ensures every consumed frame advances the progress bar.
+                    _frame_time = time.time() - _t_frame
                     yield {
                         'stage': 'processing',
                         'video_name': video_name,
@@ -2352,26 +2346,18 @@ class YOLO_octron:
                         'total_videos': total_videos,
                         'frame': frame_no + 1,
                         'total_frames': num_frames,
-                        'frame_time': _batch_wall,
+                        'frame_time': _frame_time,
                     }
-
-                # Release YOLO result objects (which hold full-resolution mask tensors) and
-                # the decoded frame batch promptly — don't wait for the next loop iteration.
-                del results_list, pending
-
-                # Prune completed zarr-write futures so the list stays small
-                if _flush_futures:
-                    _flush_futures[:] = [f for f in _flush_futures if not f.done()]
-
-                # Periodically run GC to return freed numpy/tensor memory to the allocator
-                _batch_count += 1
-                if _batch_count % 100 == 0:
-                    gc.collect()
-
-                if _done:
-                    break
+                    # Prune completed zarr-write futures so the list stays small
+                    if _flush_futures:
+                        _flush_futures[:] = [f for f in _flush_futures if not f.done()]
+                    # Periodically run GC to return freed numpy/tensor memory to the allocator
+                    _batch_count += 1
+                    if _batch_count % 100 == 0:
+                        gc.collect()
 
             decode_thread.join()
+            inference_thread.join()
 
             # A VIDEO IS COMPLETE
             if is_segment:
