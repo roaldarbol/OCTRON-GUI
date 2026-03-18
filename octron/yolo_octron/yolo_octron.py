@@ -2055,19 +2055,21 @@ class YOLO_octron:
             # doesn't idle while the CPU decodes the next batch.
             _DECODE_DONE = object()
 
-            def _decode_worker(video_, iterator_, q_):
-                for frame_no_, frame_idx_ in iterator_:
-                    try:
-                        q_.put((frame_no_, frame_idx_, video_[frame_idx_]))
-                    except StopIteration:
-                        print(f"Could not read frame {frame_idx_} from video {video_name}")
+            def _decode_worker(video_path_, frame_iterator_, device_, q_):
+                from octron.yolo_octron.helpers.video_decode import iter_frames_sequential
+                try:
+                    for frame_no_, frame_idx_, frame_ in iter_frames_sequential(
+                        video_path_, frame_iterator_, device=device_
+                    ):
+                        q_.put((frame_no_, frame_idx_, frame_))
+                except Exception as e:
+                    print(f"Decode error in {video_name}: {e}")
                 q_.put(_DECODE_DONE)
 
             frame_queue = queue.Queue(maxsize=infer_batch_size * 4)
-            frame_iterator_enum = enumerate(video_dict['frame_iterator'], start=0)
             decode_thread = threading.Thread(
                 target=_decode_worker,
-                args=(video, frame_iterator_enum, frame_queue),
+                args=(video_dict['video_file_path'], video_dict['frame_iterator'], device, frame_queue),
                 daemon=True,
             )
             decode_thread.start()
