@@ -3,9 +3,19 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 import zarr
+from zarr.codecs import BloscCodec, BloscShuffle
 
 MIN_ZARR_CHUNK_SIZE = 50 # Setting minimum chunk size for zarr arrays
                          # to avoid excessive chunking for small arrays
+
+# Fast lz4 + bitshuffle compression for int8 binary masks.
+# Bitshuffle rearranges bits before compression, giving 20-50x ratios on sparse
+# binary data and dramatically reducing chunk write time.
+_MASK_COMPRESSOR = BloscCodec(
+    cname='lz4',
+    clevel=1,
+    shuffle=BloscShuffle.bitshuffle,
+)
 
 def create_prediction_store(zarr_path, 
                             verbose=False,
@@ -84,11 +94,12 @@ def create_prediction_zarr(store,
     
     image_zarr = zarr.create_array(store=store,
                                    name=array_name,
-                                   shape=shape,  
-                                   chunks=chunks, 
+                                   shape=shape,
+                                   chunks=chunks,
                                    fill_value=fill_value,
                                    dtype=dtype,
                                    overwrite=True,
+                                   compressors=_MASK_COMPRESSOR,
                                    )
     image_zarr.attrs['created_at'] = str(datetime.now())
     image_zarr.attrs['video_hash'] = video_hash
