@@ -12,6 +12,7 @@ import time
 import random
 import sys
 import importlib.util
+import itertools
 import shutil
 from pathlib import Path
 from datetime import datetime
@@ -1711,6 +1712,7 @@ class YOLO_octron:
                   opening_radius=0,
                   overwrite=False,
                   buffer_size=500,
+                  infer_batch_size=8,
                   ):
         """
         Predict and track objects in multiple videos.
@@ -1777,7 +1779,11 @@ class YOLO_octron:
             Whether to overwrite existing prediction results
         buffer_size : int, default=500
             Number of frames to buffer before writing masks to zarr arrays
-            
+        infer_batch_size : int, default=8
+            Number of frames passed to model.predict() in a single call. Larger
+            values keep the GPU busier but use more VRAM. Set to 1 to restore
+            the original single-frame behaviour.
+
         Yields
         ------
         dict
@@ -1986,7 +1992,6 @@ class YOLO_octron:
             tracking_df_dict = {}
             track_id_label_dict = {}
             video_prediction_start = time.time()
-            frame_start = time.time()
             all_ids = []
             
             # Initialize buffer structures for masks (segmentation only)
@@ -2014,35 +2019,30 @@ class YOLO_octron:
                 buffer_counts[track_id] = 0
                 print(f"Saved mask buffer for track {track_id} to zarr ({len(frame_indices)} frames)")
             
-            for frame_no, frame_idx in enumerate(video_dict['frame_iterator'], start=0):
-                try:
-                    frame = video[frame_idx]
+            # Batched inference: collect infer_batch_size frames, run model.predict once,
+            # then feed results sequentially to the stateful tracker.
+            frame_iterator_enum = enumerate(video_dict['frame_iterator'], start=0)
+            while True:
+                chunk = list(itertools.islice(frame_iterator_enum, infer_batch_size))
+                if not chunk:
+                    break
 
-                except StopIteration:
-                    print(f"Could not read frame {frame_idx} from video {video_name}")
+                # Read frames for this batch
+                pending = []  # list of (frame_no, frame_idx, frame_data)
+                for frame_no, frame_idx in chunk:
+                    try:
+                        frame_data = video[frame_idx]
+                        pending.append((frame_no, frame_idx, frame_data))
+                    except StopIteration:
+                        print(f"Could not read frame {frame_idx} from video {video_name}")
+
+                if not pending:
                     continue
-                    
-                # Before processing the results, yield progress information 
-                # This is because we want this information regardless of whether there 
-                # were any detections in the frame
-                # Update timing information
-                if frame_no > 0:
-                    frame_time = time.time()-frame_start
-                else:
-                    frame_time = 0
-                yield {
-                    'stage': 'processing',
-                    'video_name': video_name,
-                    'video_index': video_index,
-                    'total_videos': total_videos,
-                    'frame': frame_no + 1,
-                    'total_frames': num_frames,
-                    'frame_time': frame_time,
-                }
-                frame_start = time.time()
-                # Run tracking on this frame
-                results = model.predict(
-                    source=frame, 
+
+                # Run batched inference on all frames in the chunk at once
+                batch_t = time.time()
+                results_list = model.predict(
+                    source=[p[2] for p in pending],
                     task=model_task,
                     project=save_dir.parent.as_posix(),
                     name=save_dir.name,
@@ -2054,214 +2054,227 @@ class YOLO_octron:
                     max_det=100,
                     conf=conf_thresh,
                     iou=iou_thresh,
-                    device=device, 
-                    retina_masks=retina_masks, # original image resolution, not inference resolution
+                    device=device,
+                    retina_masks=retina_masks,
                     save_txt=False,
                     save_conf=False,
                 )
-                # Then process the results ...    
-                try:
-                    confidences = results[0].boxes.conf.cpu().numpy()
-                    classes = results[0].boxes.cls.cpu().numpy()
-                    label_names = tuple([results[0].names[int(r)] for r in results[0].boxes.cls.cpu().numpy()])
-                    boxes = results[0].boxes.xyxy.cpu().numpy()
-                    if is_segment:
-                        masks = results[0].masks.data.cpu().numpy()
-                    else:
-                        masks = None
-                except AttributeError as e:
-                    print(f'No result for frame_idx {frame_idx}: {e}')
-                    continue
+                frame_time_each = (time.time() - batch_t) / len(pending)
 
-                # Pass things to the boxmot tracker 
-                # INPUT:  M X (x, y, x, y, conf, cls)
-                tracker_input = np.hstack([boxes,
-                                           confidences[:,np.newaxis],
-                                           classes[:,np.newaxis],
-                                          ])
-                tracking_result = tracker.update(tracker_input, frame)
-                if tracking_result.shape[0] == 0:
-                    print(f'No tracking result found for frame_idx {frame_idx}')
-                    continue
-                
-                # Map tracking results to original detections
-                tracked_ids, tracked_idxs = self.map_detection_index(tracker_input,
-                                                                     tracking_result,
-                                                                     per_class=per_class,
-                                                                     verbose=False,
-                                                                     )
-                # Skip if no valid tracks found
-                if not tracked_idxs:
-                    print(f'No valid tracks mapped for frame_idx {frame_idx}')
-                    continue
-                            
-                # Filter all result arrays using tracked_box_indices
-                tracked_confidences = confidences[tracked_idxs]
-                tracked_label_names = [label_names[i] for i in tracked_idxs]
-                tracked_boxes = boxes[tracked_idxs]
-                tracked_masks = masks[tracked_idxs] if is_segment else [None] * len(tracked_idxs)
-
-                # Extract tracks 
-                for track_id, label, conf, bbox, mask in zip(tracked_ids,
-                                                             tracked_label_names, 
-                                                             tracked_confidences,
-                                                             tracked_boxes,
-                                                             tracked_masks, 
-                                                             ):
-                    
-                    # Figure out if you can use the track_id or whether it needs 
-                    # to be replaced - this is a special case for when "1 subject" (one_object_per_label)
-                    # is active
-                    
-                    if one_object_per_label or iou_thresh < 0.01:
-                        # ! Use 'label' as keys in track_id_label_dict
-                        # There is only one object/track ID per label
-                        if label in track_id_label_dict:
-                            # Overwrite whatever current track ID is assigned to this label
-                            track_id = track_id_label_dict[label]
-                        else:
-                            # Assign a new, custom track ID
-                            current_ids = list(track_id_label_dict.values())
-                            track_id = (max(current_ids) + 1) if current_ids else 1
-                            track_id_label_dict[label] = track_id
-                    else: 
-                        # ! Use 'track_id' as keys in track_id_label_dict
-                        # There can be multiple objects/track IDs per label
-                        if track_id in track_id_label_dict:
-                            label_ = track_id_label_dict[track_id]
-                            if label_ != label: 
-                                raise IndexError(f'Track ID {track_id} - labels do not match: LABEL {label_} =! {label}')
-                                # This happens in cases 
-                                # where the same track ID is assigned to different labels over time 
-                                # Assign a new track ID
-                                # Get the largest key + 1, or start at 1 if dict is empty
-                                # current_ids = list(track_id_label_dict.keys())
-                                # track_id = (max(current_ids) + 1) if current_ids else 1
-                                # track_id_label_dict[track_id] = label
-                        else:
-                            track_id_label_dict[track_id] = label   
-                        
-                    # Take care of zarr array and tracking dataframe 
-                    if not track_id in all_ids:
-                        # Initialize mask store (only for segmentation models)
+                # Feed results to the tracker sequentially (tracker is stateful per-frame)
+                for (frame_no, frame_idx, frame), result in zip(pending, results_list):
+                    yield {
+                        'stage': 'processing',
+                        'video_name': video_name,
+                        'video_index': video_index,
+                        'total_videos': total_videos,
+                        'frame': frame_no + 1,
+                        'total_frames': num_frames,
+                        'frame_time': frame_time_each,
+                    }
+                    # Then process the results ...
+                    try:
+                        confidences = result.boxes.conf.cpu().numpy()
+                        classes = result.boxes.cls.cpu().numpy()
+                        label_names = tuple([result.names[int(r)] for r in result.boxes.cls.cpu().numpy()])
+                        boxes = result.boxes.xyxy.cpu().numpy()
                         if is_segment:
-                            video_shape = (video_dict['num_frames'], video_dict['height'], video_dict['width'])   
-                            mask_store = create_prediction_zarr(prediction_store, 
-                                            f'{track_id}_masks',
-                                            shape=video_shape,
-                                            chunk_size=500,     
-                                            fill_value=-1,
-                                            dtype='int8',                           
-                                            video_hash=''
-                                            )
-                            mask_store.attrs['label'] = label
-                            mask_store.attrs['classes'] = results[0].names
-                            mask_buffers[track_id] = {}
-                            buffer_counts[track_id] = 0
-                            mask_stores[track_id] = mask_store
-                        
-                        # Initialize tracking dataframe
-                        tracking_df = self.create_tracking_dataframe(video_dict, 
-                                                                     region_properties=region_properties,
-                                                                     extra_properties=extra_properties)
-                        tracking_df.attrs['video_name'] = video_name
-                        tracking_df.attrs['label'] = label
-                        tracking_df.attrs['track_id'] = track_id
-                        tracking_df_dict[track_id] = tracking_df
-
-                        all_ids.append(track_id)
-                    else:
-                        tracking_df = tracking_df_dict[track_id]
-                        assert tracking_df.attrs['track_id'] == track_id, "ID mismatch" 
-                        assert tracking_df.attrs['label'] == label, "Label mismatch"
-                        if is_segment:
-                            mask_store = mask_stores[track_id]
-
-                    # Check if a row already exists and compare current confidence with existing one
-                    # This happens if one_object_per_label is True or iou_thresh < 0.01 
-                    # and there are multiple detections
-                    if (frame_no, frame_idx, track_id) in tracking_df.index:
-                        existing_conf = tracking_df.loc[(frame_no, frame_idx, track_id), 'confidence']
-                        if conf <= existing_conf and iou_thresh >= 0.01:
-                            # Skip this detection if a better one already exists
-                            # and we are not fusing masks (iou_thresh > 0)
-                            continue
+                            masks = result.masks.data.cpu().numpy()
                         else:
-                            # Average the confidence values
-                            conf = (conf + existing_conf) / 2
-                    
-                    # Mask processing (segmentation models only)
-                    if is_segment:
-                        mask = postprocess_mask(mask, opening_radius=opening_radius)
-                        if iou_thresh < 0.01:
-                            # Fuse this mask with prior mask (if any) from buffer or zarr
-                            if frame_idx in mask_buffers[track_id]:
-                                previous_mask = mask_buffers[track_id][frame_idx].copy()
+                            masks = None
+                    except AttributeError as e:
+                        print(f'No result for frame_idx {frame_idx}: {e}')
+                        continue
+
+                    # Pass things to the boxmot tracker
+                    # INPUT:  M X (x, y, x, y, conf, cls)
+                    tracker_input = np.hstack([boxes,
+                                               confidences[:,np.newaxis],
+                                               classes[:,np.newaxis],
+                                              ])
+                    tracking_result = tracker.update(tracker_input, frame)
+                    if tracking_result.shape[0] == 0:
+                        print(f'No tracking result found for frame_idx {frame_idx}')
+                        continue
+
+                    # Map tracking results to original detections
+                    tracked_ids, tracked_idxs = self.map_detection_index(tracker_input,
+                                                                         tracking_result,
+                                                                         per_class=per_class,
+                                                                         verbose=False,
+                                                                         )
+                    # Skip if no valid tracks found
+                    if not tracked_idxs:
+                        print(f'No valid tracks mapped for frame_idx {frame_idx}')
+                        continue
+
+                    # Filter all result arrays using tracked_box_indices
+                    tracked_confidences = confidences[tracked_idxs]
+                    tracked_label_names = [label_names[i] for i in tracked_idxs]
+                    tracked_boxes = boxes[tracked_idxs]
+                    tracked_masks = masks[tracked_idxs] if is_segment else [None] * len(tracked_idxs)
+
+                    # Extract tracks
+                    for track_id, label, conf, bbox, mask in zip(tracked_ids,
+                                                                 tracked_label_names,
+                                                                 tracked_confidences,
+                                                                 tracked_boxes,
+                                                                 tracked_masks,
+                                                                 ):
+
+                        # Figure out if you can use the track_id or whether it needs
+                        # to be replaced - this is a special case for when "1 subject" (one_object_per_label)
+                        # is active
+
+                        if one_object_per_label or iou_thresh < 0.01:
+                            # ! Use 'label' as keys in track_id_label_dict
+                            # There is only one object/track ID per label
+                            if label in track_id_label_dict:
+                                # Overwrite whatever current track ID is assigned to this label
+                                track_id = track_id_label_dict[label]
                             else:
-                                previous_mask = mask_store[frame_idx,:,:].copy()
-                                previous_mask[previous_mask == -1] = 0
-                            mask = np.logical_or(previous_mask, mask)
-                            mask = mask.astype('int8')
-                        # Add to buffer instead of writing directly
-                        mask_buffers[track_id][frame_idx] = mask
-                        buffer_counts[track_id] = buffer_counts.get(track_id, 0) + 1
-                        if buffer_counts[track_id] >= buffer_size:
-                            _flush_mask_buffer(track_id)
-                    
-                    # Store tracking data directly (no buffering for tracking dataframes)
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_x'] = (bbox[0] + bbox[2])/2
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_y'] = (bbox[1] + bbox[3])/2
-                    bbox_w = bbox[2] - bbox[0]
-                    bbox_h = bbox[3] - bbox[1]
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_area'] = bbox_w * bbox_h
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_aspect_ratio'] = bbox_w / bbox_h if bbox_h > 0 else np.nan
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_x_min'] = bbox[0]
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_x_max'] = bbox[2]
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_y_min'] = bbox[1]
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_y_max'] = bbox[3]
-                    tracking_df.loc[(frame_no, frame_idx, track_id), 'confidence'] = conf
-                                            
-                    # If region_properties or extra_properties are specified, supplement info from regionprops extraction
-                    # (only available for segmentation models with masks)
-                    regions_props = None
-                    if region_details and is_segment:
-                        _, regions_props = find_objects_in_mask(
-                            mask, min_area=0, 
-                            properties=region_properties,
-                            intensity_image=frame,
-                            extra_properties=extra_properties,
-                        )
-                        if not regions_props:
-                            # Skip if no regions were found
-                            continue
-                        
-                        # Collect property keys (expanded names from regionprops_table)
-                        _skip = {'label', 'centroid'}
-                        all_prop_keys = [k for k in regions_props[0] if k not in _skip]
-                        
-                        if len(regions_props) == 1:
-                            # Single region — store scalars directly
-                            region = regions_props[0]
-                            centroid = region['centroid']
-                            tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_x'] = centroid[1]
-                            tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_y'] = centroid[0]
-                            for k in all_prop_keys:
-                                tracking_df.loc[(frame_no, frame_idx, track_id), k] = region[k]
+                                # Assign a new, custom track ID
+                                current_ids = list(track_id_label_dict.values())
+                                track_id = (max(current_ids) + 1) if current_ids else 1
+                                track_id_label_dict[label] = track_id
                         else:
-                            # Multiple disconnected regions in one detection mask.
-                            # Store a tuple of per-region values as a string so no
-                            # information is lost.  Stored as e.g. "(120.5, 85.3)".
-                            # This avoids pandas dtype conflicts (float columns
-                            # cannot hold tuple objects) and is parsed back by
-                            # _resolve_tuples() during results loading.
-                            idx = (frame_no, frame_idx, track_id)
-                            centroids = [r['centroid'] for r in regions_props]
-                            tracking_df.loc[idx, 'pos_x'] = str(tuple(float(c[1]) for c in centroids))
-                            tracking_df.loc[idx, 'pos_y'] = str(tuple(float(c[0]) for c in centroids))
-                            for k in all_prop_keys:
-                                tracking_df.loc[idx, k] = str(tuple(float(r[k]) for r in regions_props))
+                            # ! Use 'track_id' as keys in track_id_label_dict
+                            # There can be multiple objects/track IDs per label
+                            if track_id in track_id_label_dict:
+                                label_ = track_id_label_dict[track_id]
+                                if label_ != label:
+                                    raise IndexError(f'Track ID {track_id} - labels do not match: LABEL {label_} =! {label}')
+                                    # This happens in cases
+                                    # where the same track ID is assigned to different labels over time
+                                    # Assign a new track ID
+                                    # Get the largest key + 1, or start at 1 if dict is empty
+                                    # current_ids = list(track_id_label_dict.keys())
+                                    # track_id = (max(current_ids) + 1) if current_ids else 1
+                                    # track_id_label_dict[track_id] = label
+                            else:
+                                track_id_label_dict[track_id] = label
 
-                # A FRAME IS COMPLETE
+                        # Take care of zarr array and tracking dataframe
+                        if not track_id in all_ids:
+                            # Initialize mask store (only for segmentation models)
+                            if is_segment:
+                                video_shape = (video_dict['num_frames'], video_dict['height'], video_dict['width'])
+                                mask_store = create_prediction_zarr(prediction_store,
+                                                f'{track_id}_masks',
+                                                shape=video_shape,
+                                                chunk_size=500,
+                                                fill_value=-1,
+                                                dtype='int8',
+                                                video_hash=''
+                                                )
+                                mask_store.attrs['label'] = label
+                                mask_store.attrs['classes'] = result.names
+                                mask_buffers[track_id] = {}
+                                buffer_counts[track_id] = 0
+                                mask_stores[track_id] = mask_store
+
+                            # Initialize tracking dataframe
+                            tracking_df = self.create_tracking_dataframe(video_dict,
+                                                                         region_properties=region_properties,
+                                                                         extra_properties=extra_properties)
+                            tracking_df.attrs['video_name'] = video_name
+                            tracking_df.attrs['label'] = label
+                            tracking_df.attrs['track_id'] = track_id
+                            tracking_df_dict[track_id] = tracking_df
+
+                            all_ids.append(track_id)
+                        else:
+                            tracking_df = tracking_df_dict[track_id]
+                            assert tracking_df.attrs['track_id'] == track_id, "ID mismatch"
+                            assert tracking_df.attrs['label'] == label, "Label mismatch"
+                            if is_segment:
+                                mask_store = mask_stores[track_id]
+
+                        # Check if a row already exists and compare current confidence with existing one
+                        # This happens if one_object_per_label is True or iou_thresh < 0.01
+                        # and there are multiple detections
+                        if (frame_no, frame_idx, track_id) in tracking_df.index:
+                            existing_conf = tracking_df.loc[(frame_no, frame_idx, track_id), 'confidence']
+                            if conf <= existing_conf and iou_thresh >= 0.01:
+                                # Skip this detection if a better one already exists
+                                # and we are not fusing masks (iou_thresh > 0)
+                                continue
+                            else:
+                                # Average the confidence values
+                                conf = (conf + existing_conf) / 2
+
+                        # Mask processing (segmentation models only)
+                        if is_segment:
+                            mask = postprocess_mask(mask, opening_radius=opening_radius)
+                            if iou_thresh < 0.01:
+                                # Fuse this mask with prior mask (if any) from buffer or zarr
+                                if frame_idx in mask_buffers[track_id]:
+                                    previous_mask = mask_buffers[track_id][frame_idx].copy()
+                                else:
+                                    previous_mask = mask_store[frame_idx,:,:].copy()
+                                    previous_mask[previous_mask == -1] = 0
+                                mask = np.logical_or(previous_mask, mask)
+                                mask = mask.astype('int8')
+                            # Add to buffer instead of writing directly
+                            mask_buffers[track_id][frame_idx] = mask
+                            buffer_counts[track_id] = buffer_counts.get(track_id, 0) + 1
+                            if buffer_counts[track_id] >= buffer_size:
+                                _flush_mask_buffer(track_id)
+
+                        # Store tracking data directly (no buffering for tracking dataframes)
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_x'] = (bbox[0] + bbox[2])/2
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_y'] = (bbox[1] + bbox[3])/2
+                        bbox_w = bbox[2] - bbox[0]
+                        bbox_h = bbox[3] - bbox[1]
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_area'] = bbox_w * bbox_h
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_aspect_ratio'] = bbox_w / bbox_h if bbox_h > 0 else np.nan
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_x_min'] = bbox[0]
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_x_max'] = bbox[2]
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_y_min'] = bbox[1]
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_y_max'] = bbox[3]
+                        tracking_df.loc[(frame_no, frame_idx, track_id), 'confidence'] = conf
+
+                        # If region_properties or extra_properties are specified, supplement info from regionprops extraction
+                        # (only available for segmentation models with masks)
+                        regions_props = None
+                        if region_details and is_segment:
+                            _, regions_props = find_objects_in_mask(
+                                mask, min_area=0,
+                                properties=region_properties,
+                                intensity_image=frame,
+                                extra_properties=extra_properties,
+                            )
+                            if not regions_props:
+                                # Skip if no regions were found
+                                continue
+
+                            # Collect property keys (expanded names from regionprops_table)
+                            _skip = {'label', 'centroid'}
+                            all_prop_keys = [k for k in regions_props[0] if k not in _skip]
+
+                            if len(regions_props) == 1:
+                                # Single region — store scalars directly
+                                region = regions_props[0]
+                                centroid = region['centroid']
+                                tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_x'] = centroid[1]
+                                tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_y'] = centroid[0]
+                                for k in all_prop_keys:
+                                    tracking_df.loc[(frame_no, frame_idx, track_id), k] = region[k]
+                            else:
+                                # Multiple disconnected regions in one detection mask.
+                                # Store a tuple of per-region values as a string so no
+                                # information is lost.  Stored as e.g. "(120.5, 85.3)".
+                                # This avoids pandas dtype conflicts (float columns
+                                # cannot hold tuple objects) and is parsed back by
+                                # _resolve_tuples() during results loading.
+                                idx = (frame_no, frame_idx, track_id)
+                                centroids = [r['centroid'] for r in regions_props]
+                                tracking_df.loc[idx, 'pos_x'] = str(tuple(float(c[1]) for c in centroids))
+                                tracking_df.loc[idx, 'pos_y'] = str(tuple(float(c[0]) for c in centroids))
+                                for k in all_prop_keys:
+                                    tracking_df.loc[idx, k] = str(tuple(float(r[k]) for r in regions_props))
+
+                    # A FRAME IS COMPLETE
             
             # A VIDEO IS COMPLETE 
             if is_segment:

@@ -25,6 +25,7 @@ def run_predict(
     overwrite=False,
     buffer_size=500,
     region_properties=None,
+    infer_batch_size=8,
 ):
     """
     Run YOLO prediction and tracking on one or more videos.
@@ -92,6 +93,7 @@ def run_predict(
         overwrite=overwrite,
         buffer_size=buffer_size,
         region_properties=region_properties,
+        infer_batch_size=infer_batch_size,
     ):
         stage = progress.get("stage", "")
         if stage == "skipped_video":

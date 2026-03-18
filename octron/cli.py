@@ -151,6 +151,9 @@ def predict(
         False, "--detailed",
         help="Extract detailed region properties (area, eccentricity, solidity, …) from segmentation masks via scikit-image. Ignored for detection models.",
     ),
+    infer_batch_size: int = typer.Option(
+        8, "--infer-batch-size", help="Number of frames per inference batch. Larger values increase GPU utilisation."
+    ),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
     from octron.tools.predict import run_predict
@@ -201,6 +204,7 @@ def predict(
         overwrite=overwrite,
         buffer_size=buffer_size,
         region_properties=DEFAULT_REGION_PROPERTIES if detailed else None,
+        infer_batch_size=infer_batch_size,
     )
 
 
