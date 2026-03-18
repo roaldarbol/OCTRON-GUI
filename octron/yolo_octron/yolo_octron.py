@@ -14,6 +14,7 @@ import sys
 import importlib.util
 import itertools
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
@@ -1989,7 +1990,9 @@ class YOLO_octron:
             
             # Process video frames
             video = video_dict['video']
-            tracking_df_dict = {}
+            tracking_df_dict = {}       # populated from row dicts at end of video
+            tracking_rows_dict = {}     # track_id -> {(frame_no, frame_idx): row_dict}
+            tracking_meta_dict = {}     # track_id -> attrs dict
             track_id_label_dict = {}
             video_prediction_start = time.time()
             all_ids = []
@@ -1998,46 +2001,64 @@ class YOLO_octron:
             mask_buffers = {}  # track_id -> {frame_idx: mask}
             buffer_counts = {}  # track_id -> count
             mask_stores = {}   # track_id -> zarr array
-            
+
+            # Thread pool for async zarr writes — disk I/O runs in parallel with GPU inference
+            _flush_pool = ThreadPoolExecutor(max_workers=4)
+            _flush_futures = []
+
+            def _write_to_zarr(mask_store, frame_indices, stacked_masks):
+                """Background task: write stacked masks to zarr and update annotated-frames attr."""
+                mask_store[frame_indices, :, :] = stacked_masks
+                mark_frames_annotated(mask_store, frame_indices)
+                print(f"  [zarr] wrote {len(frame_indices)} frames")
+
             def _flush_mask_buffer(track_id):
-                """
-                Helper to flush a track's mask buffer to disk
-                """
+                """Snapshot buffer, clear it immediately, then submit the zarr write asynchronously."""
                 if track_id not in buffer_counts or buffer_counts[track_id] == 0:
                     return
-                    
-                # Get the buffer and store
-                mask_buffer = mask_buffers[track_id]
-                mask_store = mask_stores[track_id]
-                frame_indices = sorted(mask_buffer.keys())
-                stacked_masks = np.stack([mask_buffer[idx] for idx in frame_indices])
-                mask_store[frame_indices,:,:] = stacked_masks
-                mark_frames_annotated(mask_store, frame_indices)
-                    
-                # Clear buffer
-                mask_buffers[track_id].clear()
+                frame_indices = sorted(mask_buffers[track_id].keys())
+                stacked_masks = np.stack([mask_buffers[track_id][i] for i in frame_indices])
+                # Clear now so new frames accumulate while the write runs in the background
+                mask_buffers[track_id] = {}
                 buffer_counts[track_id] = 0
-                print(f"Saved mask buffer for track {track_id} to zarr ({len(frame_indices)} frames)")
+                future = _flush_pool.submit(_write_to_zarr, mask_stores[track_id], frame_indices, stacked_masks)
+                _flush_futures.append(future)
             
-            # Batched inference: collect infer_batch_size frames, run model.predict once,
-            # then feed results sequentially to the stateful tracker.
-            frame_iterator_enum = enumerate(video_dict['frame_iterator'], start=0)
-            while True:
-                chunk = list(itertools.islice(frame_iterator_enum, infer_batch_size))
-                if not chunk:
-                    break
+            # Pipelined batched inference:
+            # A background thread pre-reads frames into a bounded queue so the GPU
+            # doesn't idle while the CPU decodes the next batch.
+            _DECODE_DONE = object()
 
-                # Read frames for this batch
-                pending = []  # list of (frame_no, frame_idx, frame_data)
-                for frame_no, frame_idx in chunk:
+            def _decode_worker(video_, iterator_, q_):
+                for frame_no_, frame_idx_ in iterator_:
                     try:
-                        frame_data = video[frame_idx]
-                        pending.append((frame_no, frame_idx, frame_data))
+                        q_.put((frame_no_, frame_idx_, video_[frame_idx_]))
                     except StopIteration:
-                        print(f"Could not read frame {frame_idx} from video {video_name}")
+                        print(f"Could not read frame {frame_idx_} from video {video_name}")
+                q_.put(_DECODE_DONE)
+
+            frame_queue = queue.Queue(maxsize=infer_batch_size * 4)
+            frame_iterator_enum = enumerate(video_dict['frame_iterator'], start=0)
+            decode_thread = threading.Thread(
+                target=_decode_worker,
+                args=(video, frame_iterator_enum, frame_queue),
+                daemon=True,
+            )
+            decode_thread.start()
+
+            while True:
+                # Drain up to infer_batch_size items from the decode queue
+                pending = []
+                _done = False
+                for _ in range(infer_batch_size):
+                    item = frame_queue.get()
+                    if item is _DECODE_DONE:
+                        _done = True
+                        break
+                    pending.append(item)
 
                 if not pending:
-                    continue
+                    break
 
                 # Run batched inference on all frames in the chunk at once
                 batch_t = time.time()
@@ -2173,28 +2194,32 @@ class YOLO_octron:
                                 buffer_counts[track_id] = 0
                                 mask_stores[track_id] = mask_store
 
-                            # Initialize tracking dataframe
-                            tracking_df = self.create_tracking_dataframe(video_dict,
-                                                                         region_properties=region_properties,
-                                                                         extra_properties=extra_properties)
-                            tracking_df.attrs['video_name'] = video_name
-                            tracking_df.attrs['label'] = label
-                            tracking_df.attrs['track_id'] = track_id
-                            tracking_df_dict[track_id] = tracking_df
+                            # Initialize row accumulation for this track
+                            tracking_rows_dict[track_id] = {}
+                            tracking_meta_dict[track_id] = {
+                                'video_hash': video_dict.get('hash', ''),
+                                'video_name': video_name,
+                                'label': label,
+                                'track_id': track_id,
+                                'video_height': video_dict.get('height', np.nan),
+                                'video_width': video_dict.get('width', np.nan),
+                                'frame_count': video_dict['num_frames'],
+                                'frame_count_analyzed': video_dict['num_frames_analyzed'],
+                                'created_at': str(datetime.now()),
+                            }
 
                             all_ids.append(track_id)
                         else:
-                            tracking_df = tracking_df_dict[track_id]
-                            assert tracking_df.attrs['track_id'] == track_id, "ID mismatch"
-                            assert tracking_df.attrs['label'] == label, "Label mismatch"
+                            assert tracking_meta_dict[track_id]['track_id'] == track_id, "ID mismatch"
+                            assert tracking_meta_dict[track_id]['label'] == label, "Label mismatch"
                             if is_segment:
                                 mask_store = mask_stores[track_id]
 
                         # Check if a row already exists and compare current confidence with existing one
                         # This happens if one_object_per_label is True or iou_thresh < 0.01
                         # and there are multiple detections
-                        if (frame_no, frame_idx, track_id) in tracking_df.index:
-                            existing_conf = tracking_df.loc[(frame_no, frame_idx, track_id), 'confidence']
+                        if (frame_no, frame_idx) in tracking_rows_dict[track_id]:
+                            existing_conf = tracking_rows_dict[track_id][(frame_no, frame_idx)]['confidence']
                             if conf <= existing_conf and iou_thresh >= 0.01:
                                 # Skip this detection if a better one already exists
                                 # and we are not fusing masks (iou_thresh > 0)
@@ -2221,22 +2246,27 @@ class YOLO_octron:
                             if buffer_counts[track_id] >= buffer_size:
                                 _flush_mask_buffer(track_id)
 
-                        # Store tracking data directly (no buffering for tracking dataframes)
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_x'] = (bbox[0] + bbox[2])/2
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_y'] = (bbox[1] + bbox[3])/2
+                        # Accumulate tracking data as a plain dict — zero pandas overhead in hot loop.
+                        # DataFrames are built once per video at the end from these dicts.
                         bbox_w = bbox[2] - bbox[0]
                         bbox_h = bbox[3] - bbox[1]
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_area'] = bbox_w * bbox_h
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_aspect_ratio'] = bbox_w / bbox_h if bbox_h > 0 else np.nan
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_x_min'] = bbox[0]
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_x_max'] = bbox[2]
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_y_min'] = bbox[1]
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'bbox_y_max'] = bbox[3]
-                        tracking_df.loc[(frame_no, frame_idx, track_id), 'confidence'] = conf
+                        row = {
+                            'frame_counter': frame_no,
+                            'frame_idx': frame_idx,
+                            'track_id': track_id,
+                            'pos_x': (bbox[0] + bbox[2]) / 2,
+                            'pos_y': (bbox[1] + bbox[3]) / 2,
+                            'bbox_area': bbox_w * bbox_h,
+                            'bbox_aspect_ratio': bbox_w / bbox_h if bbox_h > 0 else np.nan,
+                            'bbox_x_min': float(bbox[0]),
+                            'bbox_x_max': float(bbox[2]),
+                            'bbox_y_min': float(bbox[1]),
+                            'bbox_y_max': float(bbox[3]),
+                            'confidence': conf,
+                        }
 
                         # If region_properties or extra_properties are specified, supplement info from regionprops extraction
                         # (only available for segmentation models with masks)
-                        regions_props = None
                         if region_details and is_segment:
                             _, regions_props = find_objects_in_mask(
                                 mask, min_area=0,
@@ -2256,10 +2286,10 @@ class YOLO_octron:
                                 # Single region — store scalars directly
                                 region = regions_props[0]
                                 centroid = region['centroid']
-                                tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_x'] = centroid[1]
-                                tracking_df.loc[(frame_no, frame_idx, track_id), 'pos_y'] = centroid[0]
+                                row['pos_x'] = centroid[1]
+                                row['pos_y'] = centroid[0]
                                 for k in all_prop_keys:
-                                    tracking_df.loc[(frame_no, frame_idx, track_id), k] = region[k]
+                                    row[k] = region[k]
                             else:
                                 # Multiple disconnected regions in one detection mask.
                                 # Store a tuple of per-region values as a string so no
@@ -2267,20 +2297,47 @@ class YOLO_octron:
                                 # This avoids pandas dtype conflicts (float columns
                                 # cannot hold tuple objects) and is parsed back by
                                 # _resolve_tuples() during results loading.
-                                idx = (frame_no, frame_idx, track_id)
                                 centroids = [r['centroid'] for r in regions_props]
-                                tracking_df.loc[idx, 'pos_x'] = str(tuple(float(c[1]) for c in centroids))
-                                tracking_df.loc[idx, 'pos_y'] = str(tuple(float(c[0]) for c in centroids))
+                                row['pos_x'] = str(tuple(float(c[1]) for c in centroids))
+                                row['pos_y'] = str(tuple(float(c[0]) for c in centroids))
                                 for k in all_prop_keys:
-                                    tracking_df.loc[idx, k] = str(tuple(float(r[k]) for r in regions_props))
+                                    row[k] = str(tuple(float(r[k]) for r in regions_props))
+
+                        # Store row (dict key overwrites on duplicate — handles one_object_per_label case)
+                        tracking_rows_dict[track_id][(frame_no, frame_idx)] = row
 
                     # A FRAME IS COMPLETE
-            
-            # A VIDEO IS COMPLETE 
+
+                if _done:
+                    break
+
+            decode_thread.join()
+
+            # A VIDEO IS COMPLETE
             if is_segment:
                 for track_id in all_ids:
                     _flush_mask_buffer(track_id)
+                # Block until all async zarr writes have landed before writing metadata
+                for fut in _flush_futures:
+                    fut.result()
+                _flush_pool.shutdown(wait=False)
                 
+            # Build DataFrames from accumulated row dicts (one allocation per track per video)
+            import pandas as pd
+            for track_id in all_ids:
+                rows = list(tracking_rows_dict[track_id].values())
+                if rows:
+                    df = pd.DataFrame.from_records(rows)
+                    df = df.set_index(['frame_counter', 'frame_idx', 'track_id'])
+                else:
+                    df = pd.DataFrame(
+                        index=pd.MultiIndex.from_tuples(
+                            [], names=['frame_counter', 'frame_idx', 'track_id']
+                        )
+                    )
+                df.attrs = tracking_meta_dict[track_id]
+                tracking_df_dict[track_id] = df
+
             # Save each tracking DataFrame with a label column added
             for track_id, tr_df in tracking_df_dict.items():
                 label = tr_df.attrs["label"]
