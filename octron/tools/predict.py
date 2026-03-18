@@ -121,9 +121,10 @@ def run_predict(
         eta_s = int(eta)
         eta_str = f"{eta_s // 3600:02d}:{(eta_s % 3600) // 60:02d}:{eta_s % 60:02d}"
         print(
-            f"  [{stage}] video {vidx}/{total_v} ({video}): "
+            f"\r\033[K  [{stage}] video {vidx}/{total_v} ({video}): "
             f"frame {frame}/{total_f} | {pct:.1f}% | {fps:.1f} fps | ETA: {eta_str}",
-            end="\r\033[K",
+            end="",
+            flush=True,
         )
     print()
     elapsed = time.time() - _wall_start
