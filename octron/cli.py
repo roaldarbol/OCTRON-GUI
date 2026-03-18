@@ -154,9 +154,6 @@ def predict(
     infer_batch_size: int = typer.Option(
         8, "--infer-batch-size", help="Number of frames per inference batch. Larger values increase GPU utilisation."
     ),
-    infer_batch_size: int = typer.Option(
-        8, "--infer-batch-size", help="Number of frames per inference batch. Larger values increase GPU utilisation."
-    ),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
     from octron.tools.predict import run_predict

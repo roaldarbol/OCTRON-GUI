@@ -1010,7 +1010,7 @@ class YOLO_octron:
             model_name_path = self.models_yaml_path.parent / f'models/{model_name_path}'
             
         model = YOLO(model_name_path)
-        print(f"Model loaded from '{model_name_path.as_posix()}' (mode: {train_mode})")
+        print(f"Model loaded from '{model_name_path.as_posix()}'")
         self.model = model
         return model
     
@@ -1993,6 +1993,8 @@ class YOLO_octron:
             tracking_df_dict = {}       # populated from row dicts at end of video
             tracking_rows_dict = {}     # track_id -> {(frame_no, frame_idx): row_dict}
             tracking_meta_dict = {}     # track_id -> attrs dict
+            _n_no_result = 0            # frames with no YOLO detections
+            _n_no_track = 0             # frames where tracker returned nothing
             track_id_label_dict = {}
             video_prediction_start = time.time()
             all_ids = []
@@ -2121,8 +2123,8 @@ class YOLO_octron:
                             masks = result.masks.data.cpu().numpy()
                         else:
                             masks = None
-                    except AttributeError as e:
-                        print(f'No result for frame_idx {frame_idx}: {e}')
+                    except AttributeError:
+                        _n_no_result += 1
                         continue
 
                     # Pass things to the boxmot tracker
@@ -2133,7 +2135,7 @@ class YOLO_octron:
                                               ])
                     tracking_result = tracker.update(tracker_input, frame)
                     if tracking_result.shape[0] == 0:
-                        print(f'No tracking result found for frame_idx {frame_idx}')
+                        _n_no_track += 1
                         continue
 
                     # Map tracking results to original detections
@@ -2144,7 +2146,7 @@ class YOLO_octron:
                                                                          )
                     # Skip if no valid tracks found
                     if not tracked_idxs:
-                        print(f'No valid tracks mapped for frame_idx {frame_idx}')
+                        _n_no_track += 1
                         continue
 
                     # Filter all result arrays using tracked_box_indices
@@ -2383,6 +2385,11 @@ class YOLO_octron:
                     written_idxs = sorted({frame_idx for (_, frame_idx) in tracking_rows_dict[track_id].keys()})
                     mark_frames_annotated(mask_stores[track_id], written_idxs)
                 
+            if _n_no_result:
+                print(f"  {_n_no_result} frame(s) had no detections.")
+            if _n_no_track:
+                print(f"  {_n_no_track} frame(s) had detections but no confirmed tracks (tracker warmup or low confidence).")
+
             # Build DataFrames from accumulated row dicts (one allocation per track per video)
             import pandas as pd
             for track_id in all_ids:
