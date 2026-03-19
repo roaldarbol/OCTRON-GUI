@@ -115,7 +115,7 @@ class YOLO_octron:
                                                 force_download=False
                                                 )
         else:
-            print("No models YAML path provided. Model dictionary will be empty.") 
+            pass  # No models YAML — model dict stays empty (fine for CLI predict/train)
         
         # If a project path was provided, set it through the property setter
         if project_path is not None:
@@ -1010,7 +1010,6 @@ class YOLO_octron:
             model_name_path = self.models_yaml_path.parent / f'models/{model_name_path}'
             
         model = YOLO(model_name_path)
-        print(f"Model loaded from '{model_name_path.as_posix()}'")
         self.model = model
         return model
     
@@ -1697,7 +1696,7 @@ class YOLO_octron:
         return tracked_ids, tracked_idxs
     
     
-    def predict_batch(self, 
+    def predict_batch(self,
                   videos,
                   model_path,
                   device,
@@ -1714,6 +1713,7 @@ class YOLO_octron:
                   overwrite=False,
                   buffer_size=200,
                   infer_batch_size=8,
+                  output_dir=None,
                   ):
         """
         Predict and track objects in multiple videos.
@@ -1870,7 +1870,6 @@ class YOLO_octron:
         # Determine model task (detect vs segment)
         model_task = self.get_model_info(model_path).get('task') or 'segment'
         is_segment = (model_task == 'segment')
-        print(f"Model task: {model_task} ({'segmentation' if is_segment else 'detection'})")
         
         # Detection models do not produce masks — disable mask-dependent options
         region_details = bool(region_properties) or bool(extra_properties)
@@ -1883,22 +1882,16 @@ class YOLO_octron:
         # Collect extra property column names from callable __name__
         extra_prop_names = [fn.__name__ for fn in extra_properties] if extra_properties else []
         
-        # Try to find model args 
+        # Try to find model args
         model_args = self.load_model_args(model_name_path=model_path)
         if model_args is not None:
-            print('Model args loaded from', model_path.parent.parent.as_posix())
             imgsz = model_args['imgsz']
             rect = model_args.get('rect', True)
-            print(f'Image size: {imgsz}, rect={rect}')
         else:
-            print('No model args found, using default image size of 640 and rect=True')
             imgsz = 640
             rect = True
         
         skip_frames = int(max(0, skip_frames))
-        
-        if one_object_per_label:
-            print("⚠ Tracking only one object per label.")
         
         # Calculate total frames across all videos
         total_videos = len(videos_dict)
@@ -1910,20 +1903,31 @@ class YOLO_octron:
             videos_dict[video_name]['num_frames_analyzed'] = len(frame_iterator)
         
         total_frames = sum(v['num_frames_analyzed'] for v in videos_dict.values())
-        
+
+        yield {
+            'stage': 'predict_init',
+            'model_path': str(model_path),
+            'model_task': model_task,
+            'imgsz': imgsz,
+            'tracker': tracker_id,
+            'device': device,
+            'total_videos': total_videos,
+            'total_frames': total_frames,
+            'skip_frames': skip_frames,
+            'one_object_per_label': one_object_per_label,
+        }
+
         # Process each video
         for video_index, (video_name, video_dict) in enumerate(videos_dict.items(), start=0):
             num_frames = video_dict['num_frames_analyzed']
-            
-            print(f'\nProcessing video {video_index+1}/{total_videos}: {video_name}')
             video_path = Path(video_dict['video_file_path'])
-            
+
             # Check overwrite BEFORE loading the model to avoid unnecessary work
-            save_dir = video_path.parent / 'octron_predictions' / f"{video_path.stem}_{tracker_name}"
+            _pred_root = Path(output_dir) if output_dir else video_path.parent / 'octron_predictions'
+            save_dir = _pred_root / f"{video_path.stem}_{tracker_name}"
             if save_dir.exists() and overwrite:
                 shutil.rmtree(save_dir)
             elif save_dir.exists() and not overwrite:
-                print(f"Skipping {video_name}: predictions already exist at {save_dir}. Pass --overwrite to replace.")
                 yield {
                     'stage': 'skipped_video',
                     'video_name': video_name,
@@ -1933,6 +1937,15 @@ class YOLO_octron:
                 }
                 continue
             
+            yield {
+                'stage': 'video_init',
+                'video_name': video_name,
+                'video_index': video_index,
+                'total_videos': total_videos,
+                'num_frames': num_frames,
+                'save_dir': str(save_dir),
+            }
+
             # Load model anew for every video since the tracker persists
             try:
                 model = self.load_model(model_name_path=model_path)
@@ -2096,6 +2109,7 @@ class YOLO_octron:
             inference_thread.start()
 
             _batch_count = 0
+            _t_frame = time.time()
             while True:
                 item = results_queue.get()
                 if isinstance(item, Exception):
@@ -2104,7 +2118,6 @@ class YOLO_octron:
                     break
 
                 frame_no, frame_idx, frame, result = item
-                _t_frame = time.time()
 
                 # Feed results to the tracker sequentially (tracker is stateful per-frame).
                 # try/finally ensures every frame is reported in the progress bar, even when
@@ -2338,7 +2351,12 @@ class YOLO_octron:
                 finally:
                     # Always fires — even when a frame had no detections (continue above).
                     # This ensures every consumed frame advances the progress bar.
-                    _frame_time = time.time() - _t_frame
+                    # Timing starts before results_queue.get() so it captures true
+                    # wall-clock time per frame (including inference wait), not just
+                    # the trivial CPU work on frames with no detections.
+                    now = time.time()
+                    _frame_time = now - _t_frame
+                    _t_frame = now
                     yield {
                         'stage': 'processing',
                         'video_name': video_name,
@@ -2420,7 +2438,7 @@ class YOLO_octron:
                 with open(csv_path, 'w') as f:
                     f.write('\n'.join(header) + '\n') 
                     df_to_save.to_csv(f, na_rep='NaN', lineterminator='\n')
-                print(f"Saved tracking data for '{label}' (track ID: {track_id}) to {filename}")
+                pass  # summary printed after metadata below
             
             # Save a json file with all metadata / parameters used for prediction 
             json_meta_path = save_dir / 'prediction_metadata.json'
@@ -2503,7 +2521,8 @@ class YOLO_octron:
             
             with open(json_meta_path, 'w') as f:
                 json.dump(metadata_to_save, f, indent=4)
-            print(f"Saved prediction metadata to {json_meta_path.as_posix()}")
+            n_tracks = len(tracking_df_dict)
+            print(f"\n  Saved {n_tracks} track(s) + metadata to {save_dir.as_posix()}")
             
             yield {
                     'stage': 'video_complete',

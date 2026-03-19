@@ -156,6 +156,10 @@ def predict(
     infer_batch_size: int = typer.Option(
         8, "--infer-batch-size", help="Number of frames per inference batch. Larger values increase GPU utilisation."
     ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", "-o",
+        help="Directory where octron_predictions/ folders are written. Defaults to alongside each video file.",
+    ),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
     from octron.tools.predict import run_predict
@@ -207,6 +211,7 @@ def predict(
         buffer_size=buffer_size,
         region_properties=DEFAULT_REGION_PROPERTIES if detailed else None,
         infer_batch_size=infer_batch_size,
+        output_dir=output_dir,
     )
 
 
