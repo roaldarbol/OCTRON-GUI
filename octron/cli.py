@@ -166,10 +166,22 @@ def predict(
         None, "--output-dir", "-o",
         help="Directory where octron_predictions/ folders are written. Defaults to alongside each video file.",
     ),
+    debug: bool = typer.Option(
+        False, "--debug",
+        help="Enable debug logging: per-chunk write times, queue diagnostics, and post-processing timings.",
+    ),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
+    import logging
     from octron.tools.predict import run_predict
     from octron.test_gpu import auto_device
+
+    _octron_log = logging.getLogger('octron')
+    if not _octron_log.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter('  %(message)s'))
+        _octron_log.addHandler(_h)
+    _octron_log.setLevel(logging.DEBUG if debug else logging.WARNING)
 
     expanded = []
     for p in videos:
@@ -223,6 +235,7 @@ def predict(
         region_properties=DEFAULT_REGION_PROPERTIES if detailed else None,
         infer_batch_size=infer_batch_size,
         output_dir=output_dir,
+        debug=debug,
     )
 
 
