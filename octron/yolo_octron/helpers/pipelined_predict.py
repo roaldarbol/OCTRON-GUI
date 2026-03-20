@@ -20,7 +20,11 @@ threading to avoid concurrent CUDA operations with the inference thread.
 """
 
 import threading
+import time
+from collections import deque
+
 import numpy as np
+from loguru import logger
 
 
 # Sentinels consumed by workers to signal completion
@@ -92,6 +96,7 @@ def run_inference_worker(
         If True, forward the raw frame in the results tuple so the tracker
         can compute ReID embeddings.  If False, forward ``None`` instead.
     """
+    _infer_times: deque = deque(maxlen=50)
     try:
         while True:
             # --- drain up to infer_batch_size frames from the decode queue ---
@@ -108,6 +113,7 @@ def run_inference_worker(
                 break
 
             # --- GPU inference ------------------------------------------------
+            _t_infer = time.perf_counter()
             results_list = model.predict(
                 source=[p[2] for p in pending],
                 task=model_task,
@@ -126,6 +132,20 @@ def run_inference_worker(
                 save_txt=False,
                 save_conf=False,
             )
+
+            # --- record inference timing -----------------------------------
+            _dt_infer = time.perf_counter() - _t_infer
+            _n = len(pending)
+            for _ in range(_n):
+                _infer_times.append(_dt_infer / _n)
+            if len(_infer_times) == _infer_times.maxlen:
+                avg_ms = 1000 * sum(_infer_times) / len(_infer_times)
+                logger.debug(
+                    f"[infer]  {avg_ms:.1f} ms/frame  ({1000/avg_ms:.0f} fps)"
+                    f"  batch={_n}  frame_q={frame_queue.qsize()}"
+                    f"  results_q={results_queue.qsize()}"
+                )
+                _infer_times.clear()
 
             # --- push results to tracker stage --------------------------------
             for (frame_no, frame_idx, frame), result in zip(pending, results_list):
@@ -196,6 +216,7 @@ def run_tracker_worker(
     map_detection_index_fn : callable
         Bound method ``YOLO_octron.map_detection_index``.
     """
+    _track_times: deque = deque(maxlen=100)
     try:
         while True:
             item = results_queue.get()
@@ -240,9 +261,11 @@ def run_tracker_worker(
             # was not forwarded (non-ReID, no region_details) pass a 1×1 dummy
             # so the validation passes without the 6 MB memory traffic.
             tracker_frame = frame if frame is not None else np.zeros((1, 1, 3), dtype=np.uint8)
+            _t_track = time.perf_counter()
             tracking_result = tracker.update(tracker_input, tracker_frame)
 
             if tracking_result.shape[0] == 0:
+                _track_times.append(time.perf_counter() - _t_track)
                 tracking_queue.put({
                     'frame_no': frame_no,
                     'frame_idx': frame_idx,
@@ -256,6 +279,7 @@ def run_tracker_worker(
                 tracker_input, tracking_result, per_class=per_class, verbose=False,
             )
             if not tracked_idxs:
+                _track_times.append(time.perf_counter() - _t_track)
                 tracking_queue.put({
                     'frame_no': frame_no,
                     'frame_idx': frame_idx,
@@ -263,6 +287,35 @@ def run_tracker_worker(
                     'status': 'no_track',
                 })
                 continue
+
+            # Convert only the tracked masks to int8 here (tracker thread) so
+            # the main thread's chunk-buffer write becomes a plain int8→int8
+            # memcpy instead of a float32→int8 type-converting copy.
+            #
+            # We write each mask directly into a pre-allocated int8 output via
+            # np.copyto(casting='unsafe') rather than masks[tracked_idxs].astype()
+            # — the latter first fancy-indexes a new float32 array (allocating
+            # ~50 MB) and then type-converts it, doubling the memory traffic.
+            # The loop below does a single type-converting write per mask (~10 MB
+            # each) with no intermediate allocation.
+            if is_segment:
+                n = len(tracked_idxs)
+                _, H, W = masks.shape
+                tracked_masks = np.empty((n, H, W), dtype='int8')
+                for i, idx in enumerate(tracked_idxs):
+                    np.copyto(tracked_masks[i], masks[idx], casting='unsafe')
+            else:
+                tracked_masks = [None] * len(tracked_idxs)
+
+            _track_times.append(time.perf_counter() - _t_track)
+            if len(_track_times) == _track_times.maxlen:
+                avg_ms = 1000 * sum(_track_times) / len(_track_times)
+                logger.debug(
+                    f"[track]  {avg_ms:.1f} ms/frame  ({1000/avg_ms:.0f} fps)"
+                    f"  results_q={results_queue.qsize()}"
+                    f"  track_q={tracking_queue.qsize()}"
+                )
+                _track_times.clear()
 
             tracking_queue.put({
                 'frame_no':              frame_no,
@@ -273,7 +326,7 @@ def run_tracker_worker(
                 'tracked_label_names':   [label_names[i] for i in tracked_idxs],
                 'tracked_confidences':   confidences[tracked_idxs],
                 'tracked_boxes':         boxes[tracked_idxs],
-                'tracked_masks':         masks[tracked_idxs] if is_segment else [None] * len(tracked_idxs),
+                'tracked_masks':         tracked_masks,
                 'result_names':          result_names,
             })
 

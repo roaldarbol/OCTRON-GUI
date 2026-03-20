@@ -7,6 +7,7 @@ that can be used from the CLI or called programmatically.
 
 from collections import deque
 from pathlib import Path
+import sys
 import time
 
 
@@ -71,15 +72,22 @@ def run_predict(
         Root directory for octron_predictions output. Defaults to alongside
         each video file.
     """
+    from loguru import logger
     from octron.yolo_octron.yolo_octron import YOLO_octron
     from octron.test_gpu import auto_device
 
-    # Suppress boxmot's verbose loguru INFO messages (tracker init parameters)
-    try:
-        from loguru import logger as _loguru_logger
-        _loguru_logger.disable("boxmot")
-    except Exception:
-        pass
+    # Configure loguru: remove the default handler and install one at the
+    # appropriate level.  This is the single place where log verbosity is set
+    # for the entire prediction pipeline (CLI and programmatic use).
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        level="DEBUG" if debug else "WARNING",
+        format="<cyan>{time:HH:mm:ss.SSS}</cyan> | <level>{level: <7}</level> | {message}",
+        colorize=True,
+    )
+    # Silence boxmot's own loguru INFO chatter (tracker init parameter dumps).
+    logger.disable("boxmot")
 
     if device == "auto":
         device = auto_device()
@@ -90,6 +98,11 @@ def run_predict(
     frame_time = 0.0
     _frame_times = deque(maxlen=300)
     _current_video_frames = 0
+    _last_print_t = 0.0
+    # In debug mode slow progress updates to 2 Hz — they're just loguru INFO lines
+    # that scroll alongside the timing diagnostics, so no need for high frequency.
+    # In normal mode cap at 30 Hz to avoid Windows CONPTY overhead.
+    _PRINT_INTERVAL = 0.5 if debug else 1 / 30
 
     for progress in yolo.predict_batch(
         videos=videos,
@@ -167,14 +180,29 @@ def run_predict(
         fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
         eta_s = int(eta)
         eta_str = f"{eta_s // 3600:02d}:{(eta_s % 3600) // 60:02d}:{eta_s % 60:02d}"
-        print(
-            f"\r\033[K  {frame:,}/{total_f:,} | {pct:.1f}% | {fps:.1f} fps | ETA: {eta_str}",
-            end="",
-            flush=True,
-        )
+        now_t = time.time()
+        if now_t - _last_print_t >= _PRINT_INTERVAL:
+            if debug:
+                # In debug mode progress goes through loguru so it doesn't
+                # fight with the DEBUG lines on the same terminal line.
+                logger.info(
+                    f"[progress] {frame:,}/{total_f:,} | {pct:.1f}% | {fps:.1f} fps | ETA: {eta_str}"
+                )
+            else:
+                print(
+                    f"\r\033[K  {frame:,}/{total_f:,} | {pct:.1f}% | {fps:.1f} fps | ETA: {eta_str}",
+                    end="",
+                    flush=True,
+                )
+            _last_print_t = now_t
 
-    print()
+    if not debug:
+        print()  # close the \r progress line
     elapsed = time.time() - _wall_start
     h, rem = divmod(int(elapsed), 3600)
     m, s = divmod(rem, 60)
-    print(f"\nDone. Total time: {h:02d}:{m:02d}:{s:02d}")
+    elapsed_str = f"{h:02d}:{m:02d}:{s:02d}"
+    if debug:
+        logger.info(f"Done. Total time: {elapsed_str}")
+    else:
+        print(f"\nDone. Total time: {elapsed_str}")

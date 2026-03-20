@@ -14,7 +14,11 @@ with a single sequential pass through the video container.  Two benefits:
    to software decode silently if unavailable.
 """
 
+import time
+from collections import deque
+
 import numpy as np
+from loguru import logger
 
 
 def _try_hw_container(video_path):
@@ -83,7 +87,7 @@ def iter_frames_sequential(video_path, frame_iterator, device="cpu"):
     if device == "cuda":
         container, hw_active = _try_hw_container(video_path)
         if hw_active:
-            print(f"  Video decode: NVDEC (CUDA hardware)")
+            logger.info("Video decode: NVDEC (CUDA hardware)")
 
     if container is None:
         container = av.open(str(video_path))
@@ -94,6 +98,7 @@ def iter_frames_sequential(video_path, frame_iterator, device="cpu"):
             stream.codec_context.thread_count = 0
 
     # --------------------------------------------------------------------------
+    _decode_times: deque = deque(maxlen=100)
     try:
         stream = container.streams.video[0]
         for frame_idx, av_frame in enumerate(container.decode(stream)):
@@ -101,7 +106,16 @@ def iter_frames_sequential(video_path, frame_iterator, device="cpu"):
                 break
             if frame_idx in wanted:
                 frame_no = wanted[frame_idx]
+                _t = time.perf_counter()
                 rgb = av_frame.to_ndarray(format="rgb24")
+                _decode_times.append(time.perf_counter() - _t)
+                if len(_decode_times) == _decode_times.maxlen:
+                    avg_ms = 1000 * sum(_decode_times) / len(_decode_times)
+                    logger.debug(
+                        f"[decode] {avg_ms:.1f} ms/frame  ({1000/avg_ms:.0f} fps)"
+                        f"  frame_idx={frame_idx}"
+                    )
+                    _decode_times.clear()
                 yield frame_no, frame_idx, rgb
     finally:
         container.close()

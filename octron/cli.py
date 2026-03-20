@@ -172,16 +172,8 @@ def predict(
     ),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
-    import logging
     from octron.tools.predict import run_predict
     from octron.test_gpu import auto_device
-
-    _octron_log = logging.getLogger('octron')
-    if not _octron_log.handlers:
-        _h = logging.StreamHandler()
-        _h.setFormatter(logging.Formatter('  %(message)s'))
-        _octron_log.addHandler(_h)
-    _octron_log.setLevel(logging.DEBUG if debug else logging.WARNING)
 
     expanded = []
     for p in videos:

@@ -1,7 +1,6 @@
 # Main YOLO Octron class
 # We are using YOLO11 as the base class for YOLO Octron.
 # See also: https://docs.ultralytics.com/models/yolo11
-import logging
 import os
 import subprocess # Used to launch tensorboard
 import threading # For training to run in a separate thread
@@ -56,8 +55,7 @@ from octron.yolo_octron.helpers.training import (
 )
 
 from .helpers.yolo_results import YOLO_results
-
-_log = logging.getLogger(__name__)
+from loguru import logger
 
 
 class YOLO_octron:
@@ -1796,7 +1794,6 @@ class YOLO_octron:
             Number of frames passed to model.predict() in a single call. Larger
             values keep the GPU busier but use more VRAM. Set to 1 to restore
             the original single-frame behaviour.
-
         Yields
         ------
         dict
@@ -2099,9 +2096,9 @@ class YOLO_octron:
                             _write_errors.append(e)
                         finally:
                             _dt_write = time.time() - _t_write
-                            _log.debug(
-                                "[zarr write] track %s: chunk %s (%d MB) → %.2fs",
-                                tid, chunk_idx, data.nbytes // 1_000_000, _dt_write,
+                            logger.debug(
+                                f"[zarr write] track {tid}: chunk {chunk_idx} "
+                                f"({data.nbytes // 1_000_000} MB) → {_dt_write:.2f}s"
                             )
                             _write_semaphore.release()
                             del data
@@ -2125,9 +2122,9 @@ class YOLO_octron:
                 _dt_sem = time.time() - _t_sem
                 if _dt_sem > 0.1:
                     inflight = _MAX_INFLIGHT - _write_semaphore._value
-                    _log.warning(
-                        "[write stall] track %s: semaphore waited %.2fs (%d/%d in-flight after acquire)",
-                        track_id, _dt_sem, inflight, _MAX_INFLIGHT,
+                    logger.warning(
+                        f"[write stall] track {track_id}: semaphore waited {_dt_sem:.2f}s "
+                        f"({inflight}/{_MAX_INFLIGHT} in-flight after acquire)"
                     )
                 _ensure_track_writer(track_id)
                 _track_write_queues[track_id].put((chunk_idx, data))
@@ -2201,6 +2198,7 @@ class YOLO_octron:
             _t_frame = time.time()
             _t_wait_total = 0.0
             _t_proc_total = 0.0
+            _t_maskbuf_total = 0.0  # time spent writing masks into the numpy chunk buffer
             _diag_interval = 500
             while True:
                 _t_get = time.time()
@@ -2353,7 +2351,9 @@ class YOLO_octron:
                                 mask = np.logical_or(previous_mask, mask).astype('int8')
 
                             # Write into chunk buffer
+                            _t_mb = time.perf_counter()
                             mask_chunk_arrays[track_id][frame_slot] = mask
+                            _t_maskbuf_total += time.perf_counter() - _t_mb
                             mask_chunk_written[track_id].add(frame_idx)
 
                         # Accumulate tracking data as a plain dict — zero pandas overhead in hot loop.
@@ -2443,16 +2443,15 @@ class YOLO_octron:
                         gc.collect()
                     if _batch_count % _diag_interval == 0:
                         _inflight = _MAX_INFLIGHT - _write_semaphore._value
-                        _log.debug(
-                            "[diag @%d] queues: frame=%d infer=%d track=%d | "
-                            "wait=%.1fs proc=%.1fs | zarr in-flight=%d/%d",
-                            _batch_count,
-                            frame_queue.qsize(), results_queue.qsize(), tracking_queue.qsize(),
-                            _t_wait_total, _t_proc_total,
-                            _inflight, _MAX_INFLIGHT,
+                        logger.debug(
+                            f"[diag @{_batch_count}] queues: "
+                            f"frame={frame_queue.qsize()} infer={results_queue.qsize()} track={tracking_queue.qsize()} | "
+                            f"wait={_t_wait_total:.1f}s proc={_t_proc_total:.1f}s mask_buf={_t_maskbuf_total:.1f}s | "
+                            f"zarr in-flight={_inflight}/{_MAX_INFLIGHT}"
                         )
                         _t_wait_total = 0.0
                         _t_proc_total = 0.0
+                        _t_maskbuf_total = 0.0
 
             decode_thread.join()
             inference_thread.join()
@@ -2465,15 +2464,14 @@ class YOLO_octron:
                     _flush_mask_chunk(track_id)
                 _t0 = time.time()
                 n_pending = sum(q.qsize() for q in _track_write_queues.values())
-                _log.info("[timing] flushing %d pending zarr write(s) across %d track thread(s)…",
-                          n_pending, len(_track_write_queues))
+                logger.debug(f"[timing] flushing {n_pending} pending zarr write(s) across {len(_track_write_queues)} track thread(s)…")
                 # Signal each per-track write thread and wait for all to finish
                 # before writing metadata (mark_frames_annotated requires complete data).
                 for q in _track_write_queues.values():
                     q.put(_TRACK_WRITE_DONE)
                 for t in _track_write_threads.values():
                     t.join()
-                _log.info("[timing] zarr writes done in %.1fs", time.time() - _t0)
+                logger.debug(f"[timing] zarr writes done in {time.time() - _t0:.1f}s")
                 if _write_errors:
                     raise _write_errors[0]
                 # Write annotated_frames attr once per track — doing this after all writes avoids
@@ -2482,7 +2480,7 @@ class YOLO_octron:
                 for track_id in all_ids:
                     written_idxs = sorted({frame_idx for (_, frame_idx) in tracking_rows_dict[track_id].keys()})
                     mark_frames_annotated(mask_stores[track_id], written_idxs)
-                _log.info("[timing] mark_frames_annotated done in %.1fs", time.time() - _t0)
+                logger.debug(f"[timing] mark_frames_annotated done in {time.time() - _t0:.1f}s")
 
             if _n_no_result:
                 print(f"  {_n_no_result} frame(s) had no detections.")
@@ -2506,7 +2504,7 @@ class YOLO_octron:
                 df.attrs = tracking_meta_dict[track_id]
                 tracking_df_dict[track_id] = df
             del tracking_rows_dict
-            _log.info("[timing] DataFrame build done in %.1fs  (%d tracks)", time.time() - _t0, len(all_ids))
+            logger.debug(f"[timing] DataFrame build done in {time.time() - _t0:.1f}s  ({len(all_ids)} tracks)")
 
             # Save each tracking DataFrame with a label column added
             _t0 = time.time()
@@ -2540,7 +2538,7 @@ class YOLO_octron:
             # Save a json file with all metadata / parameters used for prediction 
             json_meta_path = save_dir / 'prediction_metadata.json'
             
-            _log.info("[timing] CSV write done in %.1fs", time.time() - _t0)
+            logger.debug(f"[timing] CSV write done in {time.time() - _t0:.1f}s")
 
             # Prepare model_path for metadata: try to make it relative if project_path is set
             meta_model_path_str = model_path.as_posix()
@@ -2621,8 +2619,8 @@ class YOLO_octron:
             _t0 = time.time()
             with open(json_meta_path, 'w') as f:
                 json.dump(metadata_to_save, f, indent=4)
-            _log.info("[timing] CSV+JSON write done in %.1fs", time.time() - _t0)
-            _log.info("[timing] total post-processing: %.1fs", time.time() - _t_postproc)
+            logger.debug(f"[timing] CSV+JSON write done in {time.time() - _t0:.1f}s")
+            logger.debug(f"[timing] total post-processing: {time.time() - _t_postproc:.1f}s")
             n_tracks = len(tracking_df_dict)
             print(f"\n  Saved {n_tracks} track(s) + metadata to {save_dir.as_posix()}")
             
