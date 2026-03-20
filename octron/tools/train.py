@@ -78,7 +78,6 @@ def run_training(
     train_fraction=0.7,
     val_fraction=0.15,
     seed=88,
-    overwrite=False,
 ):
     """
     Run the OCTRON/YOLO training pipeline.
