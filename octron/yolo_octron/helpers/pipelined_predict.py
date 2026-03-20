@@ -1,26 +1,31 @@
 """
-Pipelined inference worker for OCTRON prediction.
+Pipelined inference + tracking workers for OCTRON prediction.
 
-Separates GPU inference (Stage 2) from CPU tracking (Stage 3) so they
-run concurrently:
+Separates GPU inference (Stage 2) and CPU tracking (Stage 3) so all three
+stages run concurrently:
 
-    Stage 1  decode thread   → frame_queue
-    Stage 2  THIS worker     → results_queue      (GPU, background thread)
-    Stage 3  main generator  ← results_queue      (CPU tracking + data)
+    Stage 1  decode thread   → frame_queue      (CPU, video decode)
+    Stage 2  infer  thread   → results_queue    (GPU, YOLO inference)
+    Stage 3  tracker thread  → tracking_queue   (CPU, boxmot tracker)
+    Stage 4  main generator  ← tracking_queue   (CPU, data accumulation)
 
-The GPU no longer idles while tracker.update() runs on CPU.
+The GPU no longer idles while tracker.update() runs on CPU, and the tracker
+no longer waits for the main thread to finish accumulating data.
 
 For non-ReID trackers (ByteTrack, etc.) the raw frame is dropped after
 inference to keep results_queue memory bounded.  For ReID trackers
 (BotSort, StrongSort, …) the frame is forwarded so the tracker can
-compute appearance embeddings.
+compute appearance embeddings.  ReID backbones are forced to CPU when
+threading to avoid concurrent CUDA operations with the inference thread.
 """
 
 import threading
+import numpy as np
 
 
-# Sentinel consumed by the inference worker to signal it is finished
+# Sentinels consumed by workers to signal completion
 INFER_DONE = object()
+TRACK_DONE = object()
 
 
 def run_inference_worker(
@@ -59,7 +64,7 @@ def run_inference_worker(
     frame_queue : queue.Queue
         Input queue fed by the decode thread.
     results_queue : queue.Queue
-        Output queue consumed by the tracking stage (main thread).
+        Output queue consumed by the tracker thread.
     decode_done_sentinel : object
         The sentinel object the decode thread places in *frame_queue* when
         it has no more frames to produce (``_DECODE_DONE``).
@@ -122,7 +127,7 @@ def run_inference_worker(
                 save_conf=False,
             )
 
-            # --- push results to tracking stage --------------------------------
+            # --- push results to tracker stage --------------------------------
             for (frame_no, frame_idx, frame), result in zip(pending, results_list):
                 frame_payload = frame if is_reid else None
                 results_queue.put((frame_no, frame_idx, frame_payload, result))
@@ -133,7 +138,136 @@ def run_inference_worker(
                 break
 
     except Exception as e:
-        # Propagate the exception via the queue so the main thread can raise it
+        # Propagate the exception via the queue so the tracker thread can raise it
         results_queue.put(e)
 
     results_queue.put(INFER_DONE)
+
+
+def run_tracker_worker(
+    results_queue,
+    tracking_queue,
+    infer_done_sentinel,
+    tracker,
+    is_segment,
+    per_class,
+    map_detection_index_fn,
+):
+    """
+    Pull inference results from *results_queue*, run the boxmot tracker
+    sequentially, and push per-frame tracking summaries onto *tracking_queue*.
+
+    The tracker must be called in strict frame order (it is stateful), so
+    this worker processes one frame at a time.  GPU→CPU data transfers also
+    happen here so the main thread only handles plain numpy arrays.
+
+    Each item pushed to *tracking_queue* is a dict with keys:
+
+    ``frame_no``, ``frame_idx``, ``frame``
+        Frame counter, zarr index, and raw RGB array (may be None for
+        non-ReID trackers when region_details is False).
+
+    ``status``
+        ``'ok'`` — at least one confirmed track this frame.
+        ``'no_result'`` — YOLO produced no output (AttributeError on boxes).
+        ``'no_track'`` — tracker returned zero confirmed tracks.
+
+    When ``status == 'ok'`` the dict additionally contains:
+
+    ``tracked_ids``, ``tracked_label_names``, ``tracked_confidences``,
+    ``tracked_boxes``, ``tracked_masks``, ``result_names``
+        Filtered track data ready for data accumulation.
+
+    Parameters
+    ----------
+    results_queue : queue.Queue
+        Input queue fed by the inference worker.
+    tracking_queue : queue.Queue
+        Output queue consumed by the main generator.
+    infer_done_sentinel : object
+        The sentinel the inference worker places in *results_queue* when
+        it is finished (``INFER_DONE``).
+    tracker : boxmot tracker
+        Stateful boxmot tracker instance.  Must be called sequentially.
+    is_segment : bool
+        True for segmentation models (masks are extracted); False for detect.
+    per_class : bool
+        Passed to map_detection_index_fn.
+    map_detection_index_fn : callable
+        Bound method ``YOLO_octron.map_detection_index``.
+    """
+    try:
+        while True:
+            item = results_queue.get()
+            if isinstance(item, Exception):
+                tracking_queue.put(item)
+                break
+            if item is infer_done_sentinel:
+                break
+
+            frame_no, frame_idx, frame, result = item
+
+            # --- GPU → CPU transfers -----------------------------------------
+            try:
+                confidences  = result.boxes.conf.cpu().numpy()
+                classes      = result.boxes.cls.cpu().numpy()
+                label_names  = tuple(result.names[int(c)] for c in classes)
+                boxes        = result.boxes.xyxy.cpu().numpy()
+                masks        = result.masks.data.cpu().numpy() if is_segment else None
+                result_names = result.names
+            except AttributeError:
+                tracking_queue.put({
+                    'frame_no': frame_no,
+                    'frame_idx': frame_idx,
+                    'frame': frame,
+                    'status': 'no_result',
+                })
+                continue
+
+            # --- tracker update ----------------------------------------------
+            tracker_input = np.hstack([
+                boxes,
+                confidences[:, np.newaxis],
+                classes[:, np.newaxis],
+            ])
+            tracking_result = tracker.update(tracker_input, frame)
+
+            if tracking_result.shape[0] == 0:
+                tracking_queue.put({
+                    'frame_no': frame_no,
+                    'frame_idx': frame_idx,
+                    'frame': frame,
+                    'status': 'no_track',
+                })
+                continue
+
+            # --- map detection indices and filter arrays ----------------------
+            tracked_ids, tracked_idxs = map_detection_index_fn(
+                tracker_input, tracking_result, per_class=per_class, verbose=False,
+            )
+            if not tracked_idxs:
+                tracking_queue.put({
+                    'frame_no': frame_no,
+                    'frame_idx': frame_idx,
+                    'frame': frame,
+                    'status': 'no_track',
+                })
+                continue
+
+            tracking_queue.put({
+                'frame_no':              frame_no,
+                'frame_idx':             frame_idx,
+                'frame':                 frame,
+                'status':                'ok',
+                'tracked_ids':           tracked_ids,
+                'tracked_label_names':   [label_names[i] for i in tracked_idxs],
+                'tracked_confidences':   confidences[tracked_idxs],
+                'tracked_boxes':         boxes[tracked_idxs],
+                'tracked_masks':         masks[tracked_idxs] if is_segment else [None] * len(tracked_idxs),
+                'result_names':          result_names,
+            })
+
+    except Exception as e:
+        tracking_queue.put(e)
+
+    tracking_queue.put(TRACK_DONE)
