@@ -27,6 +27,7 @@ def run_predict(
     region_properties=None,
     infer_batch_size=8,
     output_dir=None,
+    debug=False,
 ):
     """
     Run YOLO prediction and tracking on one or more videos.

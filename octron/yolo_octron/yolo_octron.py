@@ -1,7 +1,8 @@
 # Main YOLO Octron class
 # We are using YOLO11 as the base class for YOLO Octron.
 # See also: https://docs.ultralytics.com/models/yolo11
-import os 
+import logging
+import os
 import subprocess # Used to launch tensorboard
 import threading # For training to run in a separate thread
 import queue # For training progress updates
@@ -55,6 +56,8 @@ from octron.yolo_octron.helpers.training import (
 )
 
 from .helpers.yolo_results import YOLO_results
+
+_log = logging.getLogger(__name__)
 
 
 class YOLO_octron:
@@ -2027,64 +2030,107 @@ class YOLO_octron:
             all_ids = []
             
             # Initialize buffer structures for masks (segmentation only).
-            # Each track gets a single pre-allocated (buffer_size, H, W) int8 array that is
-            # reused across flushes — no np.stack copy, constant memory per track.
-            mask_buffer_arrays = {}     # track_id -> np.ndarray(buffer_size, H, W)
-            mask_buffer_fills = {}      # track_id -> int  (frames written into current array)
-            mask_buffer_frame_idxs = {} # track_id -> list[int]  (video frame indices, for zarr)
-            mask_buffer_frame_map = {}  # track_id -> {frame_idx: slot}  (for iou_thresh<0.01 lookup)
-            mask_stores = {}            # track_id -> zarr array
+            # Each track accumulates one full zarr chunk (buffer_size × H × W) at a time.
+            # When a frame from a new chunk arrives the current chunk is flushed via a
+            # direct numcodecs encode + pathlib write_bytes call, bypassing zarr's Python
+            # async layer entirely (4–5× faster than the zarr API write path).
+            mask_chunk_arrays = {}   # track_id -> np.ndarray(buffer_size, H, W) int8, current chunk
+            mask_chunk_idxs = {}     # track_id -> int, index of the chunk currently being filled
+            mask_chunk_written = {}  # track_id -> set[frame_idx], for iou_thresh<0.01 fusion lookup
+            mask_stores = {}         # track_id -> zarr array  (for attrs + iou_thresh<0.01 read-back)
 
-            # Dedicated zarr write thread — completely decouples disk I/O from the
-            # main pipeline so zarr write latency (especially on network drives) never
-            # propagates back to stall the tracker thread, inference thread, or GPU.
+            # Per-track zarr write threads — each track gets its own queue and thread
+            # so writes to different zarr arrays run in parallel.  Writes to the same
+            # track remain sequential (one thread per track) so there is no concurrent
+            # access to a single zarr array.
             #
-            # The write queue holds at most _WRITE_QUEUE_MAXSIZE pending buffers.
-            # Each slot holds a (buffer_size × H × W) int8 array copy.  32 slots at
-            # 200×1080×1920 = ~13 GB worst-case RAM — enough to absorb many seconds
-            # of network write lag before any backpressure reaches the main thread.
-            _WRITE_DONE = object()
-            _WRITE_QUEUE_MAXSIZE = 32
-            _write_queue = queue.Queue(maxsize=_WRITE_QUEUE_MAXSIZE)
+            # A global semaphore caps total in-flight buffers to ~40 % of available
+            # RAM.  The semaphore is released by the write thread after each write, so
+            # the main thread only blocks when that RAM budget is exhausted.  With
+            # parallel writers the budget drains much faster than with a single thread,
+            # so blocks are rare and short.
+            _H = video_dict['height']
+            _W = video_dict['width']
+            _bytes_per_slot = buffer_size * _H * _W  # int8 mask buffer
+            try:
+                import psutil
+                _available_bytes = psutil.virtual_memory().available
+                _budget = int(_available_bytes * 0.40)
+                _MAX_INFLIGHT = max(8, _budget // _bytes_per_slot)
+            except Exception:
+                _MAX_INFLIGHT = 32  # safe fallback if psutil unavailable
+            print(f"  Zarr write budget: {_MAX_INFLIGHT} in-flight buffers "
+                  f"({_bytes_per_slot / 1e9:.2f} GB each)")
+
+            _TRACK_WRITE_DONE = object()
+            _write_semaphore = threading.Semaphore(_MAX_INFLIGHT)
+            _track_write_queues  = {}  # track_id -> Queue
+            _track_write_threads = {}  # track_id -> Thread
             _write_errors = []
 
-            def _zarr_write_thread():
-                """Consume (mask_store, frame_indices, data) tuples and write to zarr.
-                Zarr's numcodecs backend is already multi-threaded for compression, so
-                a single Python write thread avoids concurrent-access issues while still
-                getting parallel compression.  Errors are collected and re-raised at
-                end-of-video so they don't silently swallow data."""
-                while True:
-                    item = _write_queue.get()
-                    if item is _WRITE_DONE:
-                        break
-                    mask_store, frame_indices, data = item
-                    try:
-                        mask_store[frame_indices, :, :] = data
-                    except Exception as e:
-                        _write_errors.append(e)
+            # Direct-write codec — mirrors the compressor used in create_prediction_zarr().
+            # encode(bytes) → compressed bytes written straight to the chunk file path,
+            # bypassing zarr's Python async layer and saving ~0.85 s per write call.
+            import numcodecs as _nc
+            _blosc_codec = _nc.Blosc(cname='lz4', clevel=1, shuffle=_nc.Blosc.BITSHUFFLE)
 
-            _write_thread = threading.Thread(target=_zarr_write_thread, daemon=True)
-            _write_thread.start()
-
-            def _flush_mask_buffer(track_id):
-                """Copy filled slice, reset buffer state, enqueue write (non-blocking
-                unless _WRITE_QUEUE_MAXSIZE pending writes are already queued)."""
-                n = mask_buffer_fills.get(track_id, 0)
-                if n == 0:
+            def _ensure_track_writer(track_id):
+                """Lazily create a write thread for *track_id* (called on first flush)."""
+                if track_id in _track_write_queues:
                     return
-                frame_indices = mask_buffer_frame_idxs[track_id][:n]
-                # .copy() on just the filled slice — avoids holding the full pre-allocated array
-                data = mask_buffer_arrays[track_id][:n].copy()
-                # Free pre-allocated array immediately; re-allocated lazily on next detection.
-                del mask_buffer_arrays[track_id]
-                # Reset now so new frames accumulate while the write runs in the background.
-                mask_buffer_fills[track_id] = 0
-                mask_buffer_frame_idxs[track_id] = []
-                mask_buffer_frame_map[track_id] = {}
-                # Enqueue — blocks only if _WRITE_QUEUE_MAXSIZE buffers are already waiting,
-                # which in practice requires a severely overloaded or stalled storage backend.
-                _write_queue.put((mask_stores[track_id], frame_indices, data))
+                q = queue.Queue()
+                zarr_arr = mask_stores[track_id]
+                # Resolve the on-disk chunk root once — the zarr array must already exist.
+                _chunk_root = Path(zarr_arr.store.root) / zarr_arr.path / 'c'
+
+                def _worker(q=q, chunk_root=_chunk_root, tid=track_id):
+                    while True:
+                        item = q.get()
+                        if item is _TRACK_WRITE_DONE:
+                            break
+                        chunk_idx, data = item
+                        _t_write = time.time()
+                        try:
+                            chunk_path = chunk_root / str(chunk_idx) / '0' / '0'
+                            chunk_path.parent.mkdir(parents=True, exist_ok=True)
+                            encoded = _blosc_codec.encode(data.tobytes())
+                            chunk_path.write_bytes(encoded)
+                        except Exception as e:
+                            _write_errors.append(e)
+                        finally:
+                            _dt_write = time.time() - _t_write
+                            _log.debug(
+                                "[zarr write] track %s: chunk %s (%d MB) → %.2fs",
+                                tid, chunk_idx, data.nbytes // 1_000_000, _dt_write,
+                            )
+                            _write_semaphore.release()
+                            del data
+
+                t = threading.Thread(target=_worker, daemon=True)
+                t.start()
+                _track_write_queues[track_id]  = q
+                _track_write_threads[track_id] = t
+
+            def _flush_mask_chunk(track_id):
+                """Hand the current chunk buffer to this track's write thread.
+                Blocks only when the global RAM budget is exhausted."""
+                if track_id not in mask_chunk_arrays:
+                    return
+                data      = mask_chunk_arrays.pop(track_id)
+                chunk_idx = mask_chunk_idxs.pop(track_id)
+                mask_chunk_written.pop(track_id, None)
+                # Block if RAM budget is exhausted — rare with parallel writers.
+                _t_sem = time.time()
+                _write_semaphore.acquire()
+                _dt_sem = time.time() - _t_sem
+                if _dt_sem > 0.1:
+                    inflight = _MAX_INFLIGHT - _write_semaphore._value
+                    _log.warning(
+                        "[write stall] track %s: semaphore waited %.2fs (%d/%d in-flight after acquire)",
+                        track_id, _dt_sem, inflight, _MAX_INFLIGHT,
+                    )
+                _ensure_track_writer(track_id)
+                _track_write_queues[track_id].put((chunk_idx, data))
             
             # Pipelined batched inference:
             # A background thread pre-reads frames into a bounded queue so the GPU
@@ -2153,8 +2199,14 @@ class YOLO_octron:
 
             _batch_count = 0
             _t_frame = time.time()
+            _t_wait_total = 0.0
+            _t_proc_total = 0.0
+            _diag_interval = 500
             while True:
+                _t_get = time.time()
                 item = tracking_queue.get()
+                _dt_get = time.time() - _t_get
+                _t_wait_total += _dt_get
                 if isinstance(item, Exception):
                     raise item
                 if item is _TRACK_DONE:
@@ -2236,11 +2288,7 @@ class YOLO_octron:
                                                 )
                                 mask_store.attrs['label'] = label
                                 mask_store.attrs['classes'] = result_names
-                                H, W = video_dict['height'], video_dict['width']
-                                mask_buffer_arrays[track_id] = np.empty((buffer_size, H, W), dtype='int8')
-                                mask_buffer_fills[track_id] = 0
-                                mask_buffer_frame_idxs[track_id] = []
-                                mask_buffer_frame_map[track_id] = {}
+                                # mask_chunk_arrays/idxs/written are initialised lazily on first mask write
                                 mask_stores[track_id] = mask_store
 
                             # Initialize row accumulation for this track
@@ -2280,27 +2328,33 @@ class YOLO_octron:
                         # Mask processing (segmentation models only)
                         if is_segment:
                             mask = postprocess_mask(mask, opening_radius=opening_radius)
+
+                            frame_chunk = frame_idx // buffer_size
+                            frame_slot  = frame_idx  % buffer_size
+
+                            # Flush current chunk when the frame crosses into the next one
+                            if track_id in mask_chunk_idxs and mask_chunk_idxs[track_id] != frame_chunk:
+                                _flush_mask_chunk(track_id)
+
+                            # (Re-)initialise chunk buffer lazily on first write or after flush
+                            if track_id not in mask_chunk_arrays:
+                                H_buf, W_buf = video_dict['height'], video_dict['width']
+                                mask_chunk_arrays[track_id]  = np.full((buffer_size, H_buf, W_buf), -1, dtype='int8')
+                                mask_chunk_idxs[track_id]    = frame_chunk
+                                mask_chunk_written[track_id] = set()
+
                             if iou_thresh < 0.01:
                                 # Fuse this mask with prior mask (if any) from buffer or zarr
-                                slot = mask_buffer_frame_map[track_id].get(frame_idx)
-                                if slot is not None:
-                                    previous_mask = mask_buffer_arrays[track_id][slot].copy()
+                                if frame_idx in mask_chunk_written[track_id]:
+                                    previous_mask = mask_chunk_arrays[track_id][frame_slot].copy()
                                 else:
-                                    previous_mask = mask_store[frame_idx,:,:].copy()
+                                    previous_mask = mask_store[frame_idx, :, :].copy()
                                     previous_mask[previous_mask == -1] = 0
-                                mask = np.logical_or(previous_mask, mask)
-                                mask = mask.astype('int8')
-                            # Write into the pre-allocated buffer slot (re-allocate lazily if freed after last flush)
-                            if track_id not in mask_buffer_arrays:
-                                H_buf, W_buf = video_dict['height'], video_dict['width']
-                                mask_buffer_arrays[track_id] = np.empty((buffer_size, H_buf, W_buf), dtype='int8')
-                            slot = mask_buffer_fills[track_id]
-                            mask_buffer_arrays[track_id][slot] = mask
-                            mask_buffer_frame_idxs[track_id].append(frame_idx)
-                            mask_buffer_frame_map[track_id][frame_idx] = slot
-                            mask_buffer_fills[track_id] = slot + 1
-                            if mask_buffer_fills[track_id] >= buffer_size:
-                                _flush_mask_buffer(track_id)
+                                mask = np.logical_or(previous_mask, mask).astype('int8')
+
+                            # Write into chunk buffer
+                            mask_chunk_arrays[track_id][frame_slot] = mask
+                            mask_chunk_written[track_id].add(frame_idx)
 
                         # Accumulate tracking data as a plain dict — zero pandas overhead in hot loop.
                         # DataFrames are built once per video at the end from these dicts.
@@ -2382,31 +2436,54 @@ class YOLO_octron:
                         'total_frames': num_frames,
                         'frame_time': _frame_time,
                     }
+                    _t_proc_total += (time.time() - _t_get - _dt_get)
                     # Periodically run GC to return freed numpy/tensor memory to the allocator
                     _batch_count += 1
                     if _batch_count % 100 == 0:
                         gc.collect()
+                    if _batch_count % _diag_interval == 0:
+                        _inflight = _MAX_INFLIGHT - _write_semaphore._value
+                        _log.debug(
+                            "[diag @%d] queues: frame=%d infer=%d track=%d | "
+                            "wait=%.1fs proc=%.1fs | zarr in-flight=%d/%d",
+                            _batch_count,
+                            frame_queue.qsize(), results_queue.qsize(), tracking_queue.qsize(),
+                            _t_wait_total, _t_proc_total,
+                            _inflight, _MAX_INFLIGHT,
+                        )
+                        _t_wait_total = 0.0
+                        _t_proc_total = 0.0
 
             decode_thread.join()
             inference_thread.join()
             tracker_thread.join()
 
             # A VIDEO IS COMPLETE
+            _t_postproc = time.time()
             if is_segment:
                 for track_id in all_ids:
-                    _flush_mask_buffer(track_id)
-                # Signal write thread and wait for all queued writes to land
+                    _flush_mask_chunk(track_id)
+                _t0 = time.time()
+                n_pending = sum(q.qsize() for q in _track_write_queues.values())
+                _log.info("[timing] flushing %d pending zarr write(s) across %d track thread(s)…",
+                          n_pending, len(_track_write_queues))
+                # Signal each per-track write thread and wait for all to finish
                 # before writing metadata (mark_frames_annotated requires complete data).
-                _write_queue.put(_WRITE_DONE)
-                _write_thread.join()
+                for q in _track_write_queues.values():
+                    q.put(_TRACK_WRITE_DONE)
+                for t in _track_write_threads.values():
+                    t.join()
+                _log.info("[timing] zarr writes done in %.1fs", time.time() - _t0)
                 if _write_errors:
                     raise _write_errors[0]
                 # Write annotated_frames attr once per track — doing this after all writes avoids
                 # repeated read-modify-sort-write of a growing JSON list on every hot-path flush.
+                _t0 = time.time()
                 for track_id in all_ids:
                     written_idxs = sorted({frame_idx for (_, frame_idx) in tracking_rows_dict[track_id].keys()})
                     mark_frames_annotated(mask_stores[track_id], written_idxs)
-                
+                _log.info("[timing] mark_frames_annotated done in %.1fs", time.time() - _t0)
+
             if _n_no_result:
                 print(f"  {_n_no_result} frame(s) had no detections.")
             if _n_no_track:
@@ -2414,6 +2491,7 @@ class YOLO_octron:
 
             # Build DataFrames from accumulated row dicts (one allocation per track per video)
             import pandas as pd
+            _t0 = time.time()
             for track_id in all_ids:
                 rows = list(tracking_rows_dict[track_id].values())
                 if rows:
@@ -2427,8 +2505,11 @@ class YOLO_octron:
                     )
                 df.attrs = tracking_meta_dict[track_id]
                 tracking_df_dict[track_id] = df
+            del tracking_rows_dict
+            _log.info("[timing] DataFrame build done in %.1fs  (%d tracks)", time.time() - _t0, len(all_ids))
 
             # Save each tracking DataFrame with a label column added
+            _t0 = time.time()
             for track_id, tr_df in tracking_df_dict.items():
                 label = tr_df.attrs["label"]
                 df_to_save = tr_df.copy()
@@ -2459,6 +2540,8 @@ class YOLO_octron:
             # Save a json file with all metadata / parameters used for prediction 
             json_meta_path = save_dir / 'prediction_metadata.json'
             
+            _log.info("[timing] CSV write done in %.1fs", time.time() - _t0)
+
             # Prepare model_path for metadata: try to make it relative if project_path is set
             meta_model_path_str = model_path.as_posix()
             if self.project_path:
@@ -2535,8 +2618,11 @@ class YOLO_octron:
                 "original_model_training_args": model_args if model_args is not None else "Model args not found",
             }
             
+            _t0 = time.time()
             with open(json_meta_path, 'w') as f:
                 json.dump(metadata_to_save, f, indent=4)
+            _log.info("[timing] CSV+JSON write done in %.1fs", time.time() - _t0)
+            _log.info("[timing] total post-processing: %.1fs", time.time() - _t_postproc)
             n_tracks = len(tracking_df_dict)
             print(f"\n  Saved {n_tracks} track(s) + metadata to {save_dir.as_posix()}")
             
