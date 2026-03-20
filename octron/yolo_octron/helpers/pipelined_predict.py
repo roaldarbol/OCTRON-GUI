@@ -230,7 +230,12 @@ def run_tracker_worker(
                 confidences[:, np.newaxis],
                 classes[:, np.newaxis],
             ])
-            tracking_result = tracker.update(tracker_input, frame)
+            # boxmot validates that the image argument is an ndarray even for
+            # IoU-only trackers that don't actually use it.  When the full frame
+            # was not forwarded (non-ReID, no region_details) pass a 1×1 dummy
+            # so the validation passes without the 6 MB memory traffic.
+            tracker_frame = frame if frame is not None else np.zeros((1, 1, 3), dtype=np.uint8)
+            tracking_result = tracker.update(tracker_input, tracker_frame)
 
             if tracking_result.shape[0] == 0:
                 tracking_queue.put({

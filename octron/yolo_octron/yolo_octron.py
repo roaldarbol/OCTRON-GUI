@@ -1674,38 +1674,27 @@ class YOLO_octron:
             assert all(0 <= idx < tracker_input.shape[0] for idx in tracked_idxs), \
                 "Detection index out of bounds in non-per-class mode"
         else:
-            # Complex case: per-class tracking requires mapping class-specific indices back to global indices
+            # Per-class tracking: column 7 of tracking_result is the detection index *within
+            # the class-filtered input*, not the global index.  Map back to global by computing
+            # the sorted global positions of each class's detections once per class (O(N) per
+            # class), then index directly — no floating-point scan needed.
             res_classes = tracking_result[:, 6]
-            # Loop over extracted classes
             for res_class in np.unique(res_classes).astype(int):
-                # Filter results and inputs by class
-                res_filtered = tracking_result[tracking_result[:, 6] == res_class]
-                input_filtered = tracker_input[tracker_input[:, 5] == res_class]
+                res_filtered    = tracking_result[tracking_result[:, 6] == res_class]
+                # Global indices of all detections belonging to this class, in original order
+                global_indices  = np.where(tracker_input[:, 5] == res_class)[0]
                 for res_line in res_filtered:
                     track_id = int(res_line[4])
                     tracked_ids.append(track_id)
-                    
-                    idx_res = int(res_line[7]) # This is the index of the result in the class filtered tracker input
-                    if idx_res < 0 or idx_res >= len(input_filtered):
+
+                    idx_res = int(res_line[7])  # index within class-filtered input
+                    if idx_res < 0 or idx_res >= len(global_indices):
                         raise IndexError(
                             f"Detection index {idx_res} out of bounds for class {res_class} "
-                            f"(max: {len(input_filtered) - 1})"
+                            f"(max: {len(global_indices) - 1})"
                         )
-                    input_line = input_filtered[idx_res]
-                    
-                    try:
-                        # Find the index of this line in the original input array
-                        # This should not be necessary, but I want to make sure I get the right line ... 
-                        matches = np.all(np.isclose(tracker_input, input_line, rtol=1e-5, atol=1e-8), axis=1)
-                        if not np.any(matches):
-                            raise ValueError(f"Could not find matching detection for track {track_id}")
-                        
-                        tracked_idx = int(np.where(matches)[0][0])
-                        tracked_idxs.append(tracked_idx)
-                    except Exception as e:
-                        raise ValueError(
-                            f"Failed to find original index for track {track_id}, class {res_class}: {e}"
-                        ) from e
+                    tracked_idx = int(global_indices[idx_res])
+                    tracked_idxs.append(tracked_idx)
 
                     if verbose: print(f'Matched\n{res_line} with\n{tracker_input[tracked_idx]}')
                     
@@ -2121,9 +2110,13 @@ class YOLO_octron:
             )
             decode_thread.start()
 
-            # Always keep the raw frame: boxmot validates img is np.ndarray even for
-            # IoU-only trackers (ByteTrack), and region_details needs it too.
-            _needs_frame = True
+            # Keep the full raw frame only when actually needed downstream:
+            #   - ReID trackers use it for appearance feature extraction
+            #   - region_details uses it for intensity-based regionprops
+            # For IoU-only trackers without region_details the tracker thread passes
+            # a 1×1 dummy frame to satisfy boxmot's ndarray validation, which avoids
+            # queuing ~6 MB per frame through two queue hops for no purpose.
+            _needs_frame = is_reid or region_details
 
             from octron.yolo_octron.helpers.pipelined_predict import (
                 run_inference_worker,
