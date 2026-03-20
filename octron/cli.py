@@ -60,6 +60,11 @@ app = typer.Typer(
 def default(ctx: typer.Context):
     """Launch the OCTRON napari GUI (default), or run a subcommand."""
     if ctx.invoked_subcommand is None:
+        from octron._logging import setup_logging, print_welcome
+        setup_logging()
+        print_welcome()
+        from loguru import logger
+        logger.info("Loading libraries (this may take a moment)...")
         from octron.main import octron_gui
 
         octron_gui()
@@ -68,6 +73,11 @@ def default(ctx: typer.Context):
 @app.command()
 def gui():
     """Launch the OCTRON napari GUI."""
+    from octron._logging import setup_logging, print_welcome
+    setup_logging()
+    print_welcome()
+    from loguru import logger
+    logger.info("Loading libraries (this may take a moment)...")
     from octron.main import octron_gui
 
     octron_gui()
@@ -181,7 +191,8 @@ def predict(
             found = sorted(f for f in p.iterdir() if f.suffix.lower() == ".mp4")
             if not found:
                 raise typer.BadParameter(f"No .mp4 files found in directory: {p}", param_hint="videos")
-            print(f"Found {len(found)} video(s) in {p}")
+            from loguru import logger
+            logger.info(f"Found {len(found)} video(s) in {p}")
             expanded.extend(found)
         else:
             expanded.append(p)
