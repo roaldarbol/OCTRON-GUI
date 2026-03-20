@@ -15,7 +15,6 @@ import struct
 import importlib.util
 import itertools
 import shutil
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
@@ -2047,47 +2046,56 @@ class YOLO_octron:
             mask_buffer_frame_map = {}  # track_id -> {frame_idx: slot}  (for iou_thresh<0.01 lookup)
             mask_stores = {}            # track_id -> zarr array
 
-            # Thread pool for async zarr writes — disk I/O runs in parallel with GPU inference.
-            # _flush_semaphore limits how many write tasks may be in-flight (queued + running)
-            # at once.  Each pending task holds a (buffer_size × H × W) data copy in RAM;
-            # without backpressure the queue can grow to hundreds of entries → OOM.
-            _FLUSH_MAX_INFLIGHT = 8
-            _flush_pool = ThreadPoolExecutor(max_workers=4)
-            _flush_futures = []
-            _flush_semaphore = threading.Semaphore(_FLUSH_MAX_INFLIGHT)
+            # Dedicated zarr write thread — completely decouples disk I/O from the
+            # main pipeline so zarr write latency (especially on network drives) never
+            # propagates back to stall the tracker thread, inference thread, or GPU.
+            #
+            # The write queue holds at most _WRITE_QUEUE_MAXSIZE pending buffers.
+            # Each slot holds a (buffer_size × H × W) int8 array copy.  32 slots at
+            # 200×1080×1920 = ~13 GB worst-case RAM — enough to absorb many seconds
+            # of network write lag before any backpressure reaches the main thread.
+            _WRITE_DONE = object()
+            _WRITE_QUEUE_MAXSIZE = 32
+            _write_queue = queue.Queue(maxsize=_WRITE_QUEUE_MAXSIZE)
+            _write_errors = []
 
-            def _write_to_zarr(semaphore, mask_store, frame_indices, data):
-                """Background task: write mask data to zarr and release semaphore slot.
-                NOTE: mark_frames_annotated is intentionally NOT called here — the attrs
-                are written once per track at the end of the video instead, avoiding
-                repeated read-modify-sort-write of a growing JSON list on every flush."""
-                try:
-                    mask_store[frame_indices, :, :] = data
-                finally:
-                    semaphore.release()
+            def _zarr_write_thread():
+                """Consume (mask_store, frame_indices, data) tuples and write to zarr.
+                Zarr's numcodecs backend is already multi-threaded for compression, so
+                a single Python write thread avoids concurrent-access issues while still
+                getting parallel compression.  Errors are collected and re-raised at
+                end-of-video so they don't silently swallow data."""
+                while True:
+                    item = _write_queue.get()
+                    if item is _WRITE_DONE:
+                        break
+                    mask_store, frame_indices, data = item
+                    try:
+                        mask_store[frame_indices, :, :] = data
+                    except Exception as e:
+                        _write_errors.append(e)
+
+            _write_thread = threading.Thread(target=_zarr_write_thread, daemon=True)
+            _write_thread.start()
 
             def _flush_mask_buffer(track_id):
-                """Copy filled slice, release pre-alloc array, submit write with backpressure."""
+                """Copy filled slice, reset buffer state, enqueue write (non-blocking
+                unless _WRITE_QUEUE_MAXSIZE pending writes are already queued)."""
                 n = mask_buffer_fills.get(track_id, 0)
                 if n == 0:
                     return
                 frame_indices = mask_buffer_frame_idxs[track_id][:n]
                 # .copy() on just the filled slice — avoids holding the full pre-allocated array
                 data = mask_buffer_arrays[track_id][:n].copy()
-                # Free the pre-allocated array immediately; re-allocated lazily on next detection.
+                # Free pre-allocated array immediately; re-allocated lazily on next detection.
                 del mask_buffer_arrays[track_id]
-                # Reset immediately so new frames accumulate while the write runs
+                # Reset now so new frames accumulate while the write runs in the background.
                 mask_buffer_fills[track_id] = 0
                 mask_buffer_frame_idxs[track_id] = []
                 mask_buffer_frame_map[track_id] = {}
-                # Block if too many writes are already queued — deliberate backpressure that
-                # prevents unlimited accumulation of (buffer_size × H × W) arrays in the queue.
-                _flush_semaphore.acquire()
-                future = _flush_pool.submit(
-                    _write_to_zarr, _flush_semaphore,
-                    mask_stores[track_id], frame_indices, data,
-                )
-                _flush_futures.append(future)
+                # Enqueue — blocks only if _WRITE_QUEUE_MAXSIZE buffers are already waiting,
+                # which in practice requires a severely overloaded or stalled storage backend.
+                _write_queue.put((mask_stores[track_id], frame_indices, data))
             
             # Pipelined batched inference:
             # A background thread pre-reads frames into a bounded queue so the GPU
@@ -2381,9 +2389,6 @@ class YOLO_octron:
                         'total_frames': num_frames,
                         'frame_time': _frame_time,
                     }
-                    # Prune completed zarr-write futures so the list stays small
-                    if _flush_futures:
-                        _flush_futures[:] = [f for f in _flush_futures if not f.done()]
                     # Periodically run GC to return freed numpy/tensor memory to the allocator
                     _batch_count += 1
                     if _batch_count % 100 == 0:
@@ -2397,10 +2402,12 @@ class YOLO_octron:
             if is_segment:
                 for track_id in all_ids:
                     _flush_mask_buffer(track_id)
-                # Block until all async zarr writes have landed before writing metadata
-                for fut in _flush_futures:
-                    fut.result()
-                _flush_pool.shutdown(wait=False)
+                # Signal write thread and wait for all queued writes to land
+                # before writing metadata (mark_frames_annotated requires complete data).
+                _write_queue.put(_WRITE_DONE)
+                _write_thread.join()
+                if _write_errors:
+                    raise _write_errors[0]
                 # Write annotated_frames attr once per track — doing this after all writes avoids
                 # repeated read-modify-sort-write of a growing JSON list on every hot-path flush.
                 for track_id in all_ids:
