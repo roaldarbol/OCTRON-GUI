@@ -237,7 +237,6 @@ def run_tracker_worker(
                 masks        = result.masks.data.cpu().numpy() if is_segment else None
                 result_names = result.names
             except AttributeError:
-                del result
                 tracking_queue.put({
                     'frame_no': frame_no,
                     'frame_idx': frame_idx,
@@ -248,6 +247,9 @@ def run_tracker_worker(
             finally:
                 # Release the YOLO result object immediately — it holds references to
                 # GPU tensors that won't be freed until the object is GC'd otherwise.
+                # NOTE: only `finally` deletes `result`; the `except` block must NOT
+                # also delete it, because `finally` always runs after `except` and
+                # would then hit an UnboundLocalError on the already-deleted name.
                 del result
 
             # --- tracker update ----------------------------------------------
