@@ -1737,6 +1737,7 @@ class YOLO_octron:
                   buffer_size=200,
                   infer_batch_size=8,
                   output_dir=None,
+                  video_cache_dir=None,
                   ):
         """
         Predict and track objects in multiple videos.
@@ -2109,10 +2110,26 @@ class YOLO_octron:
                     logger.debug(f'No result for frame_idx {frame_idx}: {e}')
                 q_.put(_DECODE_DONE)
 
+            # --- video input cache ----------------------------------------
+            # Copy the video to a local directory before decoding so that
+            # network-share reads do not throttle the decode thread.
+            _cached_video_path = None
+            if video_cache_dir is not None:
+                _vc_dir = Path(video_cache_dir)
+                _vc_dir.mkdir(parents=True, exist_ok=True)
+                _cached_video_path = _vc_dir / video_path.name
+                _vc_size_mb = video_path.stat().st_size / 1_000_000
+                logger.info(f"Caching video ({_vc_size_mb:.0f} MB): {video_path.name}")
+                _vc_t0 = time.time()
+                shutil.copy2(str(video_path), str(_cached_video_path))
+                logger.info(f"Video cached ({time.time() - _vc_t0:.1f} s)")
+            _decode_video_path = _cached_video_path if _cached_video_path is not None else video_path
+            # ---------------------------------------------------------------
+
             frame_queue = queue.Queue(maxsize=infer_batch_size * 4)
             decode_thread = threading.Thread(
                 target=_decode_worker,
-                args=(video_dict['video_file_path'], video_dict['frame_iterator'], device, frame_queue),
+                args=(_decode_video_path, video_dict['frame_iterator'], device, frame_queue),
                 daemon=True,
             )
             decode_thread.start()
@@ -2406,6 +2423,15 @@ class YOLO_octron:
 
             decode_thread.join()
             inference_thread.join()
+
+            # Release the cached video copy as soon as the threads are done so
+            # disk space is freed before CSV/zarr writing and before the next
+            # video starts.  On interrupt the caller's finally block deletes the
+            # entire temp directory, so this path is always cleaned up regardless.
+            if _cached_video_path is not None and _cached_video_path.exists():
+                _cached_video_path.unlink()
+                _cached_video_path = None
+                logger.debug(f"Removed cached video: {video_path.name}")
 
             # A VIDEO IS COMPLETE
             if is_segment:

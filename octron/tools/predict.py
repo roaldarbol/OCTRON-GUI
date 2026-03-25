@@ -57,7 +57,7 @@ def run_predict(
     infer_batch_size=8,
     output_dir=None,
     debug=False,
-    local_cache_dir=None,
+    cache=False,
 ):
     """
     Run YOLO prediction and tracking on one or more videos.
@@ -102,13 +102,14 @@ def run_predict(
         each video file.
     debug : bool
         Enable DEBUG-level logging (per-stage timing diagnostics).
-    local_cache_dir : str or Path, optional
-        Write zarr output here first, then move to *output_dir* after each
-        video completes.  Automatically enabled when *output_dir* is a UNC /
-        network path (``\\\\server\\share`` or ``//server/share``).  Pass an
-        explicit path to force caching even for local network drives or to
-        choose which local volume is used (e.g. your NVMe scratch space).
-        The cache directory is always deleted on exit, whether prediction
+    cache : bool
+        Copy each video to a local temp directory before decoding, and write
+        zarr output there too before moving it to *output_dir*.  Eliminates
+        SMB / network-share bottlenecks for both read (video decode) and write
+        (zarr atomic rename).  Automatically enabled when *output_dir* or any
+        input video path is a UNC / network path
+        (``\\\\server\\share`` or ``//server/share``).
+        The temp directory is always deleted on exit, whether prediction
         finishes normally, is interrupted, or crashes.
     """
     from loguru import logger
@@ -124,24 +125,36 @@ def run_predict(
     yolo = YOLO_octron()
 
     # --- local-cache setup ---------------------------------------------------
-    # Zarr uses atomic-write (write tmp, then os.replace) which fails on SMB /
-    # network shares on Windows.  Writing to a local temp dir and moving the
-    # completed folder to the network destination avoids this entirely.
+    # Two reasons to cache locally:
+    # 1. Zarr uses atomic-write (write tmp, then os.replace) which fails on SMB
+    #    / network shares on Windows — zarr output must go to a local temp dir.
+    # 2. NVDEC still reads the compressed bitstream over the network; copying
+    #    the video locally first eliminates the SMB read bottleneck.
+    # Both are handled via a single temp dir: videos/ for input, the root for
+    # zarr output (octron_predictions/ sub-folder created inside it).
     _temp_dir: Path | None = None
     _final_output_dir = Path(output_dir) if output_dir is not None else None
-    _needs_cache = local_cache_dir is not None or (
-        _final_output_dir is not None and _is_network_path(_final_output_dir)
+
+    # Normalise videos to a flat list of Paths for network-path detection.
+    if isinstance(videos, (str, Path)):
+        _video_list: list[Path] = [Path(videos)]
+    elif isinstance(videos, list):
+        _video_list = [Path(v) for v in videos]
+    else:
+        _video_list = []  # dict format (GUI): skip auto-detection on video paths
+
+    _needs_cache = (
+        cache
+        or (_final_output_dir is not None and _is_network_path(_final_output_dir))
+        or any(_is_network_path(v) for v in _video_list)
     )
 
     if _needs_cache:
-        if local_cache_dir is not None:
-            _temp_dir = Path(local_cache_dir) / f"octron_cache_{os.getpid()}"
-            _temp_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            _temp_dir = Path(tempfile.mkdtemp(prefix="octron_cache_"))
+        _temp_dir = Path(tempfile.mkdtemp(prefix="octron_cache_"))
         effective_output_dir = str(_temp_dir)
+        _dest_label = str(_final_output_dir) if _final_output_dir else "(alongside videos)"
         logger.info(f"Local cache:  {_temp_dir}")
-        logger.info(f"Destination:  {_final_output_dir}")
+        logger.info(f"Destination:  {_dest_label}")
 
         # Belt-and-suspenders: also register an atexit handler so the temp dir
         # is cleaned up even if the process is killed before the finally block
@@ -209,6 +222,7 @@ def run_predict(
             region_properties=region_properties,
             infer_batch_size=infer_batch_size,
             output_dir=effective_output_dir,
+            video_cache_dir=str(_temp_dir / "videos") if _temp_dir is not None else None,
         ):
             stage = progress.get("stage", "")
 
