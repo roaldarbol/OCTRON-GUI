@@ -60,9 +60,11 @@ app = typer.Typer(
 @app.callback()
 def default(ctx: typer.Context):
     """Launch the OCTRON napari GUI (default), or run a subcommand."""
-    from octron._logging import setup_logging, print_welcome
-    setup_logging()
-    print_welcome()
+    import sys
+    if "--help" not in sys.argv and "-h" not in sys.argv:
+        from octron._logging import setup_logging, print_welcome
+        setup_logging()
+        print_welcome()
     if ctx.invoked_subcommand is None:
         logger.info("Loading libraries (this may take a moment)...")
         from octron.main import octron_gui
