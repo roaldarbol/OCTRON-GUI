@@ -9,6 +9,7 @@ import atexit
 import os
 import shutil
 import tempfile
+from statistics import median
 from collections import deque
 from pathlib import Path
 import time
@@ -264,7 +265,7 @@ def run_predict(
             frame_time = progress.get("frame_time", frame_time)
             if frame_time > 0:
                 _frame_times.append(frame_time)
-            avg_frame_time = sum(_frame_times) / len(_frame_times) if _frame_times else 0.0
+            avg_frame_time = median(_frame_times) if _frame_times else 0.0
 
             pct = 100.0 * frame / total_f if total_f > 0 else 0.0
             remaining = total_f - frame
