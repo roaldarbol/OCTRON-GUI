@@ -162,9 +162,14 @@ def predict(
     opening_radius: int = typer.Option(0, help="Morphological opening radius applied to masks."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing prediction results. Default: skip videos that already have predictions."),
     detailed: bool = typer.Option(False, "--detailed", help="Extract detailed region properties (area, eccentricity, solidity, …) from segmentation masks via scikit-image. Ignored for detection models."),
-    buffer_size: int = typer.Option(500, help="Frame buffer size before writing to zarr."),
+    buffer_size: int = typer.Option(200, help="Frames buffered per track before flushing to zarr (also sets the zarr chunk size). Larger values mean fewer, better-compressed writes."),
+    infer_batch_size: int = typer.Option(8, "--infer-batch-size", help="Number of frames per inference batch. Larger values increase GPU utilisation."),
+    output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Directory where octron_predictions/ folders are written. Defaults to alongside each video file."),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging (per-stage timing diagnostics)."),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
+    from octron._logging import setup_logging
+    setup_logging(debug=debug)
     from octron.tools.predict import run_predict
     from octron.test_gpu import auto_device
 
@@ -218,6 +223,8 @@ def predict(
         overwrite=overwrite,
         buffer_size=buffer_size,
         region_properties=DEFAULT_REGION_PROPERTIES if detailed else None,
+        infer_batch_size=infer_batch_size,
+        output_dir=output_dir,
     )
 
 
