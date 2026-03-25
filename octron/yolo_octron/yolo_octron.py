@@ -1856,7 +1856,7 @@ class YOLO_octron:
             tracker_config = load_boxmot_tracker_config(tracker_cfg_path)
             # Extract tracker_id from the top-level key of the config YAML
             tracker_id = next(iter(tracker_config))
-            logger.info(f"Using custom tracker config: {tracker_cfg_path} (tracker: {tracker_id})")
+            logger.debug(f"Using custom tracker config: {tracker_cfg_path} (tracker: {tracker_id})")
         elif tracker_name is not None:
             # Resolve tracker name via flexible lookup in boxmot_trackers.yaml
             trackers_yaml_path = octron_base_path / 'tracking/boxmot_trackers.yaml'
@@ -1864,7 +1864,7 @@ class YOLO_octron:
             tracker_id, tracker_info = resolve_tracker(tracker_name, trackers_dict)
             tracker_cfg_path = octron_base_path / tracker_info['config_path']
             tracker_config = load_boxmot_tracker_config(tracker_cfg_path)
-            logger.info(f"Resolved tracker '{tracker_name}' -> {tracker_id}")
+            logger.debug(f"Resolved tracker '{tracker_name}' -> {tracker_id}")
         else:
             raise ValueError(
                 "Either 'tracker_name' or 'tracker_cfg_path' must be provided. "
@@ -1893,7 +1893,7 @@ class YOLO_octron:
         # Determine model task (detect vs segment)
         model_task = self.get_model_info(model_path).get('task') or 'segment'
         is_segment = (model_task == 'segment')
-        logger.info(f"Model task: {model_task} ({'segmentation' if is_segment else 'detection'})")
+        logger.debug(f"Model task: {model_task} ({'segmentation' if is_segment else 'detection'})")
 
         # Detection models do not produce masks — disable mask-dependent options
         region_details = bool(region_properties) or bool(extra_properties)
@@ -1911,12 +1911,12 @@ class YOLO_octron:
         if model_args is not None:
             imgsz = model_args['imgsz']
             rect = model_args.get('rect', True)
-            logger.info(f"Model args loaded from {model_path.parent.parent.as_posix()}")
-            logger.info(f'Image size: {imgsz}, rect={rect}')
+            logger.debug(f"Model args loaded from {model_path.parent.parent.as_posix()}")
+            logger.debug(f'Image size: {imgsz}, rect={rect}')
         else:
             imgsz = 640
             rect = True
-            logger.info('No model args found, using default image size of 640 and rect=True')
+            logger.debug('No model args found, using default image size of 640 and rect=True')
         
         skip_frames = int(max(0, skip_frames))
         if one_object_per_label:
@@ -1950,7 +1950,7 @@ class YOLO_octron:
         for video_index, (video_name, video_dict) in enumerate(videos_dict.items(), start=0):
             num_frames = video_dict['num_frames_analyzed']
             video_path = Path(video_dict['video_file_path'])
-            logger.info(f'Processing video {video_index+1}/{total_videos}: {video_name}')
+            logger.debug(f'Processing video {video_index+1}/{total_videos}: {video_name}')
 
             # Check overwrite BEFORE loading the model to avoid unnecessary work
             _pred_root = Path(output_dir) if output_dir else video_path.parent / 'octron_predictions'

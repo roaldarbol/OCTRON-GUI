@@ -94,6 +94,15 @@ def run_predict(
     # timing diagnostic lines. In normal mode cap at 30 Hz to avoid
     # Windows CONPTY overhead.
     _PRINT_INTERVAL = 0.5 if debug else 1 / 30
+    # Track whether a \r progress line is currently open so we can close it
+    # (with a plain newline) before emitting any logger output.
+    _progress_line_open = False
+
+    def _close_progress():
+        nonlocal _progress_line_open
+        if _progress_line_open:
+            print()
+            _progress_line_open = False
 
     try:
         for progress in yolo.predict_batch(
@@ -128,11 +137,11 @@ def run_predict(
                     flags.append(f"skip={skip}")
                 if progress.get("one_object_per_label"):
                     flags.append("one-per-label")
-                flag_str = f"  [{', '.join(flags)}]" if flags else ""
-                print(f"\n  Model:    {model_p.name}  [{task} · imgsz={imgsz}]")
-                print(f"  Tracker:  {tracker}")
-                print(f"  Device:   {device}")
-                print(f"  Videos:   {n_videos}{flag_str}")
+                flag_str = f" [{', '.join(flags)}]" if flags else ""
+                logger.info(f"Model:    {model_p.name}  [{task} · imgsz={imgsz}]")
+                logger.info(f"Tracker:  {tracker}")
+                logger.info(f"Device:   {device}")
+                logger.info(f"Videos:   {n_videos}{flag_str}")
                 continue
 
             if stage == "video_init":
@@ -143,17 +152,18 @@ def run_predict(
                 save_dir   = progress.get("save_dir", "")
                 _current_video_frames = num_frames
                 _frame_times.clear()  # reset rolling average per video
-                print(f"\nVideo {vidx}/{total_v}: {video_name}")
-                print(f"  Frames:   {num_frames:,}")
-                print(f"  Output:   {save_dir}")
+                _close_progress()
+                logger.info(f"Video {vidx}/{total_v}: {video_name}")
+                logger.info(f"Frames:   {num_frames:,}")
+                logger.info(f"Output:   {save_dir}")
                 continue
 
             if stage == "skipped_video":
                 video_name = progress.get("video_name", "")
                 save_dir   = progress.get("save_dir", "")
-                print(f"\nVideo: {video_name}")
-                print(f"  [skipped] predictions already exist at {save_dir}")
-                print(f"  Use --overwrite to replace.")
+                _close_progress()
+                logger.info(f"Video: {video_name}")
+                logger.warning(f"Skipped — predictions already exist at {save_dir}. Use --overwrite to replace.")
                 continue
 
             if stage != "processing":
@@ -185,21 +195,16 @@ def run_predict(
                         end="",
                         flush=True,
                     )
+                    _progress_line_open = True
                 _last_print_t = now_t
 
     except KeyboardInterrupt:
-        if not debug:
-            print()  # close the \r progress line
+        _close_progress()
         logger.warning("Interrupted — stopping prediction.")
         return
 
-    if not debug:
-        print()  # close the \r progress line
+    _close_progress()
     elapsed = time.time() - _wall_start
     h, rem = divmod(int(elapsed), 3600)
     m, s = divmod(rem, 60)
-    elapsed_str = f"{h:02d}:{m:02d}:{s:02d}"
-    if debug:
-        logger.info(f"Done. Total time: {elapsed_str}")
-    else:
-        print(f"\nDone. Total time: {elapsed_str}")
+    logger.info(f"Done. Total time: {h:02d}:{m:02d}:{s:02d}")
