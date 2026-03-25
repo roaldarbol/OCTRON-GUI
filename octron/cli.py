@@ -164,6 +164,7 @@ def predict(
     buffer_size: int = typer.Option(200, help="Frames buffered per track before flushing to zarr (also sets the zarr chunk size). Larger values mean fewer, better-compressed writes."),
     infer_batch_size: int = typer.Option(8, "--infer-batch-size", help="Number of frames per inference batch. Larger values increase GPU utilisation."),
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Directory where octron_predictions/ folders are written. Defaults to alongside each video file."),
+    local_cache_dir: Optional[Path] = typer.Option(None, "--local-cache-dir", help="Write zarr output here first, then move to --output-dir when each video finishes. Enabled automatically for network/UNC paths. Useful for NVMe scratch space."),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging (per-stage timing diagnostics)."),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
@@ -224,6 +225,7 @@ def predict(
         region_properties=DEFAULT_REGION_PROPERTIES if detailed else None,
         infer_batch_size=infer_batch_size,
         output_dir=output_dir,
+        local_cache_dir=local_cache_dir,
     )
 
 

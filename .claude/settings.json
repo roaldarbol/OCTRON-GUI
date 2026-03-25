@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python -c \":*)",
-      "Bash(.venv/Scripts/python -c \"from octron.cli import app; from typer.testing import CliRunner; r = CliRunner\\(\\).invoke\\(app, [''predict'', ''--help'']\\); print\\(r.output[-1000:]\\)\")",
-      "Bash(.venv/Scripts/python -m pytest tests/test_predict_write.py -q)"
-    ]
-  }
-}
