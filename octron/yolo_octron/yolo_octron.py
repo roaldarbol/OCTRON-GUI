@@ -2118,10 +2118,28 @@ class YOLO_octron:
                 _vc_dir = Path(video_cache_dir)
                 _vc_dir.mkdir(parents=True, exist_ok=True)
                 _cached_video_path = _vc_dir / video_path.name
-                _vc_size_mb = video_path.stat().st_size / 1_000_000
+                _vc_size = video_path.stat().st_size
+                _vc_size_mb = _vc_size / 1_000_000
                 logger.info(f"Caching video ({_vc_size_mb:.0f} MB): {video_path.name}")
                 _vc_t0 = time.time()
-                shutil.copy2(str(video_path), str(_cached_video_path))
+                _vc_chunk = 16 * 1024 * 1024  # 16 MB chunks
+                _vc_copied = 0
+                with open(str(video_path), 'rb') as _vc_src, \
+                     open(str(_cached_video_path), 'wb') as _vc_dst:
+                    while True:
+                        _vc_buf = _vc_src.read(_vc_chunk)
+                        if not _vc_buf:
+                            break
+                        _vc_dst.write(_vc_buf)
+                        _vc_copied += len(_vc_buf)
+                        _vc_pct = 100 * _vc_copied / _vc_size if _vc_size else 100
+                        print(
+                            f"\r\033[K  Caching: {_vc_pct:.0f}%"
+                            f"  ({_vc_copied / 1_000_000:.0f} / {_vc_size_mb:.0f} MB)",
+                            end="", flush=True,
+                        )
+                print()  # close the \r line
+                shutil.copystat(str(video_path), str(_cached_video_path))
                 logger.info(f"Video cached ({time.time() - _vc_t0:.1f} s)")
             _decode_video_path = _cached_video_path if _cached_video_path is not None else video_path
             # ---------------------------------------------------------------
