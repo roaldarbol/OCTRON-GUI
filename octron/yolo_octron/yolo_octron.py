@@ -1738,6 +1738,7 @@ class YOLO_octron:
                   infer_batch_size=8,
                   output_dir=None,
                   video_cache_dir=None,
+                  debug=False,
                   ):
         """
         Predict and track objects in multiple videos.
@@ -1985,7 +1986,12 @@ class YOLO_octron:
                     return
             except Exception as e:
                 logger.error(f"Error during initialization: {e}")
-                return    
+                return
+            # ultralytics replaces the loguru handler at INFO level during model load.
+            # Re-establish the project handler so debug lines from worker threads are visible.
+            if debug:
+                from octron._logging import setup_logging as _setup_logging
+                _setup_logging(debug=True)
 
             # DEPRECATED
             # if max(video_dict['height'], video_dict['width']) < imgsz:

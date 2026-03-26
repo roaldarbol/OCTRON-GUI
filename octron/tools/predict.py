@@ -125,6 +125,9 @@ def run_predict(
         device = auto_device()
 
     yolo = YOLO_octron()
+    # ultralytics replaces the loguru handler during import; re-establish ours.
+    from octron._logging import setup_logging as _setup_logging
+    _setup_logging(debug=debug)
 
     # --- local-cache setup ---------------------------------------------------
     # zarr_cache: write zarr output to a local temp dir, then move to output_dir.
@@ -241,6 +244,7 @@ def run_predict(
             infer_batch_size=infer_batch_size,
             output_dir=effective_output_dir,
             video_cache_dir=str(_temp_dir / "videos") if _do_video_cache and _temp_dir is not None else None,
+            debug=debug,
         ):
             stage = progress.get("stage", "")
 
