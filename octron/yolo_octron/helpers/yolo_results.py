@@ -55,7 +55,8 @@ class YOLO_results:
         # Initialize some variables 
         self.verbose = verbose
         self.video, self.video_dict = None, None
-        self.width, self.height, self.num_frames = None, None, None 
+        self.width, self.height, self.num_frames = None, None, None
+        self.mask_width, self.mask_height = None, None  # zarr storage dims (may be inference resolution)
         self.csvs = None
         self.zarr, self.zarr_root = None, None
         self.has_masks = False
@@ -165,7 +166,7 @@ class YOLO_results:
         store = zarr.storage.LocalStore(self.zarr, read_only=False)
         root = zarr.open_group(store=store, mode='a')
         if self.verbose:
-            logger.debug("Existing keys in zarr archive: %s", natsorted(root.array_keys()))
+            logger.debug("Existing keys in zarr archive: {}", natsorted(root.array_keys()))
         self.zarr_root = root
         self.has_masks = any(k.endswith('_masks') for k in root.array_keys())
         
@@ -175,15 +176,28 @@ class YOLO_results:
             if zarr_classes:
                 self.classes = {int(k): v for k, v in dict(zarr_classes).items()}
         
-        # Extract video dimensions from zarr if not already set from video
-        if (self.num_frames is None) or (self.height is None) or (self.width is None):
-            example_array = next(iter(self.zarr_root.array_values()), None)
-            if example_array is not None:
+        # Extract dimensions from zarr arrays.
+        # mask_height/mask_width are the zarr storage dimensions (inference resolution
+        # when retina_masks=False; same as video resolution for older prediction runs).
+        # height/width are always VIDEO resolution — read from zarr attrs if stored there,
+        # otherwise fall back to the zarr shape (legacy files where both were equal).
+        example_array = next(iter(self.zarr_root.array_values()), None)
+        if example_array is not None:
+            if self.num_frames is None:
                 self.num_frames = example_array.shape[0] if len(example_array.shape) > 0 else None
-                self.height = example_array.shape[1] if len(example_array.shape) > 1 else None
-                self.width = example_array.shape[2] if len(example_array.shape) > 2 else None   
-                if self.verbose:
-                    logger.debug(f"Extracted video dimensions from zarr: {self.num_frames} frames, {self.width}x{self.height}")
+            self.mask_height = example_array.shape[1] if len(example_array.shape) > 1 else None
+            self.mask_width  = example_array.shape[2] if len(example_array.shape) > 2 else None
+            # Prefer video_height/video_width stored in zarr attrs (written by new predictions).
+            # Fall back to zarr shape for legacy files where masks were at video resolution.
+            if self.height is None:
+                self.height = example_array.attrs.get('video_height', self.mask_height)
+            if self.width is None:
+                self.width = example_array.attrs.get('video_width', self.mask_width)
+            if self.verbose:
+                logger.debug(
+                    f"Zarr mask dims: {self.mask_width}x{self.mask_height}  "
+                    f"video dims: {self.width}x{self.height}  frames: {self.num_frames}"
+                )
 
     def get_track_ids_labels(self, csv_header_lines=None): 
         """
@@ -735,12 +749,12 @@ class YOLO_results:
                     if self.num_frames is not None: 
                         assert num_frames == self.num_frames, \
                             f"Number of frames in mask data ({num_frames}) does not match number of frames in video ({self.num_frames})."
-                    if self.height is not None:
-                        assert height == self.height, \
-                            f"Height in mask data ({height}) does not match height in video ({self.height})."
-                    if self.width is not None:
-                        assert width == self.width, \
-                            f"Width in mask data ({width}) does not match width in video ({self.width})."
+                    if self.mask_height is not None:
+                        assert height == self.mask_height, \
+                            f"Height in mask data ({height}) does not match stored mask height ({self.mask_height})."
+                    if self.mask_width is not None:
+                        assert width == self.mask_width, \
+                            f"Width in mask data ({width}) does not match stored mask width ({self.mask_width})."
                     # Find out which indices have data
                     frame_indices = get_annotated_frames(masks)
                     if len(frame_indices) == 0 and self.verbose:

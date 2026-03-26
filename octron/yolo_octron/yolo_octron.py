@@ -2000,7 +2000,12 @@ class YOLO_octron:
             #     retina_masks = False
             # else:
             #     retina_masks = True
-            retina_masks = True if is_segment else False
+            # retina_masks=False: YOLO returns masks at inference resolution
+            # (e.g. 640×360 for a 4K video at imgsz=640) instead of upsampling
+            # to full video resolution.  Masks are stored at inference resolution
+            # in zarr, which is 9–36× smaller for high-res footage.  The render
+            # pipeline upsamples on read via nearest-neighbour index mapping.
+            retina_masks = False
             
             save_dir.mkdir(parents=True, exist_ok=True)
             
@@ -2041,9 +2046,12 @@ class YOLO_octron:
             
             # Process video frames
             video = video_dict['video']
-            tracking_df_dict = {}       # populated from row dicts at end of video
-            tracking_rows_dict = {}     # track_id -> {(frame_no, frame_idx): row_dict}
-            tracking_meta_dict = {}     # track_id -> attrs dict
+            tracking_df_dict = {}        # populated from column arrays at end of video
+            tracking_cols = {}           # track_id -> {col_name: np.array(num_frames)}
+            tracking_col_fills = {}      # track_id -> int (filled slots)
+            tracking_frame_no_slot = {}  # track_id -> {frame_no: slot} for duplicate detection
+            tracking_extra_rows = {}     # track_id -> {slot: extra_props} (region_details only)
+            tracking_meta_dict = {}      # track_id -> attrs dict
             _n_no_result = 0            # frames with no YOLO detections
             _n_no_track = 0             # frames where tracker returned nothing
             track_id_label_dict = {}
@@ -2259,8 +2267,9 @@ class YOLO_octron:
             )
             tracker_thread.start()
 
-            _batch_count = 0
             _t_frame = time.time()
+            _consumer_t_window = _t_frame
+            _consumer_n_window = 0
             while True:
                 item = tracking_queue.get()
                 if isinstance(item, Exception):
@@ -2334,10 +2343,15 @@ class YOLO_octron:
                         if not track_id in all_ids:
                             # Initialize mask store (only for segmentation models)
                             if is_segment:
-                                video_shape = (video_dict['num_frames'], video_dict['height'], video_dict['width'])
+                                # Use mask's own shape (inference resolution) rather than
+                                # video resolution.  retina_masks=False means ultralytics
+                                # returns masks at imgsz, e.g. 640×360 for 4K@imgsz=640,
+                                # which is 9–36× smaller than the full video frame.
+                                H_mask, W_mask = mask.shape
+                                mask_shape = (video_dict['num_frames'], H_mask, W_mask)
                                 mask_store = create_prediction_zarr(prediction_store,
                                                 f'{track_id}_masks',
-                                                shape=video_shape,
+                                                shape=mask_shape,
                                                 chunk_size=buffer_size,
                                                 fill_value=-1,
                                                 dtype='int8',
@@ -2345,15 +2359,35 @@ class YOLO_octron:
                                                 )
                                 mask_store.attrs['label'] = label
                                 mask_store.attrs['classes'] = result_names
-                                H, W = video_dict['height'], video_dict['width']
-                                mask_buffer_arrays[track_id] = np.empty((buffer_size, H, W), dtype='int8')
+                                # Record the original video resolution so loaders can
+                                # upsample masks back to video space when needed.
+                                mask_store.attrs['video_height'] = video_dict['height']
+                                mask_store.attrs['video_width'] = video_dict['width']
+                                mask_buffer_arrays[track_id] = np.empty((buffer_size, H_mask, W_mask), dtype='int8')
                                 mask_buffer_fills[track_id] = 0
                                 mask_buffer_frame_idxs[track_id] = []
                                 mask_buffer_frame_map[track_id] = {}
                                 mask_stores[track_id] = mask_store
 
-                            # Initialize row accumulation for this track
-                            tracking_rows_dict[track_id] = {}
+                            # Initialize pre-allocated column arrays for this track.
+                            # Sized to the total frame count (upper bound on detections).
+                            _nf = video_dict['num_frames']
+                            tracking_cols[track_id] = {
+                                'frame_counter':     np.empty(_nf, dtype='int32'),
+                                'frame_idx':         np.empty(_nf, dtype='int32'),
+                                'pos_x':             np.empty(_nf, dtype='float64'),
+                                'pos_y':             np.empty(_nf, dtype='float64'),
+                                'bbox_area':         np.empty(_nf, dtype='float64'),
+                                'bbox_aspect_ratio': np.empty(_nf, dtype='float64'),
+                                'bbox_x_min':        np.empty(_nf, dtype='float64'),
+                                'bbox_x_max':        np.empty(_nf, dtype='float64'),
+                                'bbox_y_min':        np.empty(_nf, dtype='float64'),
+                                'bbox_y_max':        np.empty(_nf, dtype='float64'),
+                                'confidence':        np.empty(_nf, dtype='float64'),
+                            }
+                            tracking_col_fills[track_id] = 0
+                            tracking_frame_no_slot[track_id] = {}
+                            tracking_extra_rows[track_id] = {}
                             tracking_meta_dict[track_id] = {
                                 'video_hash': video_dict.get('hash', ''),
                                 'video_name': video_name,
@@ -2373,11 +2407,12 @@ class YOLO_octron:
                             if is_segment:
                                 mask_store = mask_stores[track_id]
 
-                        # Check if a row already exists and compare current confidence with existing one
+                        # Check if a row already exists and compare current confidence with existing one.
                         # This happens if one_object_per_label is True or iou_thresh < 0.01
-                        # and there are multiple detections
-                        if (frame_no, frame_idx) in tracking_rows_dict[track_id]:
-                            existing_conf = tracking_rows_dict[track_id][(frame_no, frame_idx)]['confidence']
+                        # and there are multiple detections on the same frame.
+                        _dup_slot = tracking_frame_no_slot[track_id].get(frame_no)
+                        if _dup_slot is not None:
+                            existing_conf = tracking_cols[track_id]['confidence'][_dup_slot]
                             if conf <= existing_conf and iou_thresh >= 0.01:
                                 # Skip this detection if a better one already exists
                                 # and we are not fusing masks (iou_thresh > 0)
@@ -2401,7 +2436,7 @@ class YOLO_octron:
                                 mask = mask.astype('int8')
                             # Write into the pre-allocated buffer slot (re-allocate lazily if freed after last flush)
                             if track_id not in mask_buffer_arrays:
-                                H_buf, W_buf = video_dict['height'], video_dict['width']
+                                H_buf, W_buf = mask.shape  # inference resolution
                                 mask_buffer_arrays[track_id] = np.empty((buffer_size, H_buf, W_buf), dtype='int8')
                             slot = mask_buffer_fills[track_id]
                             mask_buffer_arrays[track_id][slot] = mask
@@ -2411,24 +2446,29 @@ class YOLO_octron:
                             if mask_buffer_fills[track_id] >= buffer_size:
                                 _flush_mask_buffer(track_id)
 
-                        # Accumulate tracking data as a plain dict — zero pandas overhead in hot loop.
-                        # DataFrames are built once per video at the end from these dicts.
+                        # Write tracking data into pre-allocated column arrays.
+                        # Reuse the existing slot for duplicate frame_no (overwrite),
+                        # append a new slot otherwise.
                         bbox_w = bbox[2] - bbox[0]
                         bbox_h = bbox[3] - bbox[1]
-                        row = {
-                            'frame_counter': frame_no,
-                            'frame_idx': frame_idx,
-                            'track_id': track_id,
-                            'pos_x': (bbox[0] + bbox[2]) / 2,
-                            'pos_y': (bbox[1] + bbox[3]) / 2,
-                            'bbox_area': bbox_w * bbox_h,
-                            'bbox_aspect_ratio': bbox_w / bbox_h if bbox_h > 0 else np.nan,
-                            'bbox_x_min': float(bbox[0]),
-                            'bbox_x_max': float(bbox[2]),
-                            'bbox_y_min': float(bbox[1]),
-                            'bbox_y_max': float(bbox[3]),
-                            'confidence': conf,
-                        }
+                        if _dup_slot is not None:
+                            _col_slot = _dup_slot
+                        else:
+                            _col_slot = tracking_col_fills[track_id]
+                            tracking_frame_no_slot[track_id][frame_no] = _col_slot
+                            tracking_col_fills[track_id] = _col_slot + 1
+                        _cols = tracking_cols[track_id]
+                        _cols['frame_counter'][_col_slot]     = frame_no
+                        _cols['frame_idx'][_col_slot]         = frame_idx
+                        _cols['pos_x'][_col_slot]             = (bbox[0] + bbox[2]) * 0.5
+                        _cols['pos_y'][_col_slot]             = (bbox[1] + bbox[3]) * 0.5
+                        _cols['bbox_area'][_col_slot]         = bbox_w * bbox_h
+                        _cols['bbox_aspect_ratio'][_col_slot] = bbox_w / bbox_h if bbox_h > 0 else np.nan
+                        _cols['bbox_x_min'][_col_slot]        = float(bbox[0])
+                        _cols['bbox_x_max'][_col_slot]        = float(bbox[2])
+                        _cols['bbox_y_min'][_col_slot]        = float(bbox[1])
+                        _cols['bbox_y_max'][_col_slot]        = float(bbox[3])
+                        _cols['confidence'][_col_slot]        = conf
 
                         # If region_properties or extra_properties are specified, supplement info from regionprops extraction
                         # (only available for segmentation models with masks)
@@ -2448,13 +2488,15 @@ class YOLO_octron:
                             all_prop_keys = [k for k in regions_props[0] if k not in _skip]
 
                             if len(regions_props) == 1:
-                                # Single region — store scalars directly
+                                # Single region — overwrite pos_x/pos_y with mask centroid
+                                # and stash extra props for later DataFrame merge.
                                 region = regions_props[0]
                                 centroid = region['centroid']
-                                row['pos_x'] = centroid[1]
-                                row['pos_y'] = centroid[0]
-                                for k in all_prop_keys:
-                                    row[k] = region[k]
+                                _cols['pos_x'][_col_slot] = centroid[1]
+                                _cols['pos_y'][_col_slot] = centroid[0]
+                                tracking_extra_rows[track_id][_col_slot] = {
+                                    k: region[k] for k in all_prop_keys
+                                }
                             else:
                                 # Multiple disconnected regions in one detection mask.
                                 # Store a tuple of per-region values as a string so no
@@ -2462,14 +2504,16 @@ class YOLO_octron:
                                 # This avoids pandas dtype conflicts (float columns
                                 # cannot hold tuple objects) and is parsed back by
                                 # _resolve_tuples() during results loading.
+                                # pos_x/pos_y overrides go into extra_rows too (strings
+                                # cannot be stored in the float64 column arrays).
                                 centroids = [r['centroid'] for r in regions_props]
-                                row['pos_x'] = str(tuple(float(c[1]) for c in centroids))
-                                row['pos_y'] = str(tuple(float(c[0]) for c in centroids))
+                                _extra = {
+                                    'pos_x': str(tuple(float(c[1]) for c in centroids)),
+                                    'pos_y': str(tuple(float(c[0]) for c in centroids)),
+                                }
                                 for k in all_prop_keys:
-                                    row[k] = str(tuple(float(r[k]) for r in regions_props))
-
-                        # Store row (dict key overwrites on duplicate — handles one_object_per_label case)
-                        tracking_rows_dict[track_id][(frame_no, frame_idx)] = row
+                                    _extra[k] = str(tuple(float(r[k]) for r in regions_props))
+                                tracking_extra_rows[track_id][_col_slot] = _extra
 
                     # A FRAME IS COMPLETE
 
@@ -2482,6 +2526,7 @@ class YOLO_octron:
                     now = time.time()
                     _frame_time = now - _t_frame
                     _t_frame = now
+                    _consumer_n_window += 1
                     yield {
                         'stage': 'processing',
                         'video_name': video_name,
@@ -2494,10 +2539,19 @@ class YOLO_octron:
                     # Prune completed zarr-write futures so the list stays small
                     if _flush_futures:
                         _flush_futures[:] = [f for f in _flush_futures if not f.done()]
-                    # Periodically run GC to return freed numpy/tensor memory to the allocator
-                    _batch_count += 1
-                    if _batch_count % 100 == 0:
-                        gc.collect()
+                    # Periodic consumer timing diagnostic
+                    if debug:
+                        _consumer_elapsed = now - _consumer_t_window
+                        if _consumer_elapsed >= 0.5 and _consumer_n_window > 0:
+                            _c_fps = _consumer_n_window / _consumer_elapsed
+                            _c_ms  = 1000.0 / _c_fps if _c_fps > 0 else 0.0
+                            logger.debug(
+                                f"[consumer]  {_c_ms:.1f} ms/frame  ({_c_fps:.0f} fps)"
+                                f"  track_q={tracking_queue.qsize()}"
+                                f"  n_tracks={len(all_ids)}"
+                            )
+                            _consumer_t_window = now
+                            _consumer_n_window = 0
 
             decode_thread.join()
             inference_thread.join()
@@ -2526,7 +2580,8 @@ class YOLO_octron:
                 # Write annotated_frames attr once per track — doing this after all writes avoids
                 # repeated read-modify-sort-write of a growing JSON list on every hot-path flush.
                 for track_id in all_ids:
-                    written_idxs = sorted({frame_idx for (_, frame_idx) in tracking_rows_dict[track_id].keys()})
+                    _n = tracking_col_fills[track_id]
+                    written_idxs = sorted(set(tracking_cols[track_id]['frame_idx'][:_n].tolist()))
                     mark_frames_annotated(mask_stores[track_id], written_idxs)
                 
             if _n_no_result:
@@ -2534,12 +2589,22 @@ class YOLO_octron:
             if _n_no_track:
                 logger.debug(f"{_n_no_track} frame(s) had detections but no confirmed tracks (tracker warmup or low confidence).")
 
-            # Build DataFrames from accumulated row dicts (one allocation per track per video)
+            # Build DataFrames from pre-allocated column arrays (one allocation per track per video)
             import pandas as pd
             for track_id in all_ids:
-                rows = list(tracking_rows_dict[track_id].values())
-                if rows:
-                    df = pd.DataFrame.from_records(rows)
+                _n = tracking_col_fills[track_id]
+                if _n > 0:
+                    _df_data = {k: v[:_n].copy() for k, v in tracking_cols[track_id].items()}
+                    _df_data['track_id'] = np.full(_n, track_id, dtype='int32')
+                    df = pd.DataFrame(_df_data)
+                    # Merge sparse extra region-props (region_details path only)
+                    _extras = tracking_extra_rows.get(track_id, {})
+                    if _extras:
+                        for _slot, _extra_dict in _extras.items():
+                            for _col, _val in _extra_dict.items():
+                                if _col not in df.columns:
+                                    df[_col] = np.nan
+                                df.at[_slot, _col] = _val
                     df = df.set_index(['frame_counter', 'frame_idx', 'track_id'])
                 else:
                     df = pd.DataFrame(
@@ -2832,6 +2897,37 @@ class YOLO_octron:
             results_per_track.append((track_id, label, color, napari_colormap, tracking_df, features_df, masks))
 
         if open_viewer:
+            # Compute napari scale for mask layers: masks stored at inference
+            # resolution (retina_masks=False) must be scaled up to video-pixel
+            # coordinates so they align with the video image layer.
+            # Account for letterbox padding: scale from content dimensions (not
+            # full padded mask dims) to avoid stretching the mask in napari.
+            _mask_layer_scale = None
+            _mask_layer_translate = None
+            if (yolo_results.mask_height and yolo_results.height and
+                    yolo_results.mask_width and yolo_results.width):
+                _mh = yolo_results.mask_height
+                _mw = yolo_results.mask_width
+                _vh = yolo_results.height
+                _vw = yolo_results.width
+                _c_h = round(_vh * _mw / _vw)
+                if _c_h <= _mh:
+                    _c_w = _mw
+                    _p_y = (_mh - _c_h) // 2
+                    _p_x = 0
+                else:
+                    _c_h = _mh
+                    _c_w = round(_vw * _mh / _vh)
+                    _p_y = 0
+                    _p_x = (_mw - _c_w) // 2
+                _sy = _vh / _c_h
+                _sx = _vw / _c_w
+                if abs(_sy - 1.0) > 1e-3 or abs(_sx - 1.0) > 1e-3 or _p_y or _p_x:
+                    _mask_layer_scale = (1, _sy, _sx)
+                    # Translate the mask so content aligns with the video layer
+                    # (negative offset: move content up/left by the padding amount)
+                    _mask_layer_translate = (0, -_p_y * _sy, -_p_x * _sx)
+
             # Add mask layers first (bottom)
             for track_id, label, color, napari_colormap, tracking_df, features_df, masks in results_per_track:
                 if masks is not None:
@@ -2842,6 +2938,8 @@ class YOLO_octron:
                         blending='translucent',
                         colormap=napari_colormap,
                         visible=True,
+                        scale=_mask_layer_scale,
+                        translate=_mask_layer_translate,
                     )
             # Add track layers second (on top)
             for track_id, label, color, napari_colormap, tracking_df, features_df, masks in results_per_track:
