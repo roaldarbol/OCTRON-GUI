@@ -316,7 +316,7 @@ def run_predict(
             _fps_ts.append(now_t)
             while _fps_ts[0] < now_t - _FPS_WINDOW:
                 _fps_ts.popleft()
-            if len(_fps_ts) >= 2:
+            if len(_fps_ts) >= 2 and _fps_ts[-1] > _fps_ts[0]:
                 fps = (len(_fps_ts) - 1) / (_fps_ts[-1] - _fps_ts[0])
             else:
                 fps = 0.0
