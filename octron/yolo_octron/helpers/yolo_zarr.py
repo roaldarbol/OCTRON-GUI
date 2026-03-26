@@ -83,10 +83,6 @@ def create_prediction_zarr(store,
     # First dimension uses chunk_size, remaining dimensions use their full size
     chunks = (chunk_size,) + shape[1:] if len(shape) > 1 else (chunk_size,)
     
-    # Explicitly disable compression — zarr v3 defaults to ZstdCodec even when
-    # no compressor is specified, which makes writes CPU-bound (~4-5 s per chunk)
-    # rather than I/O-bound.  Prediction stores are either local temp (moved after
-    # each video) or a fast local SSD, so raw uncompressed writes are faster overall.
     image_zarr = zarr.create_array(store=store,
                                    name=array_name,
                                    shape=shape,
@@ -94,7 +90,6 @@ def create_prediction_zarr(store,
                                    fill_value=fill_value,
                                    dtype=dtype,
                                    overwrite=True,
-                                   compressors=None,
                                    )
     image_zarr.attrs['created_at'] = str(datetime.now())
     image_zarr.attrs['video_hash'] = video_hash
