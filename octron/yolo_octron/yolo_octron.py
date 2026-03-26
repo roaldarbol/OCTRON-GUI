@@ -2897,6 +2897,17 @@ class YOLO_octron:
             results_per_track.append((track_id, label, color, napari_colormap, tracking_df, features_df, masks))
 
         if open_viewer:
+            # Compute napari scale for mask layers: masks stored at inference
+            # resolution (retina_masks=False) must be scaled up to video-pixel
+            # coordinates so they align with the video image layer.
+            _mask_layer_scale = None
+            if (yolo_results.mask_height and yolo_results.height and
+                    yolo_results.mask_width and yolo_results.width):
+                _sy = yolo_results.height / yolo_results.mask_height
+                _sx = yolo_results.width  / yolo_results.mask_width
+                if abs(_sy - 1.0) > 1e-3 or abs(_sx - 1.0) > 1e-3:
+                    _mask_layer_scale = (1, _sy, _sx)
+
             # Add mask layers first (bottom)
             for track_id, label, color, napari_colormap, tracking_df, features_df, masks in results_per_track:
                 if masks is not None:
@@ -2907,6 +2918,7 @@ class YOLO_octron:
                         blending='translucent',
                         colormap=napari_colormap,
                         visible=True,
+                        scale=_mask_layer_scale,
                     )
             # Add track layers second (on top)
             for track_id, label, color, napari_colormap, tracking_df, features_df, masks in results_per_track:

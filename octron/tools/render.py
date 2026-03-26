@@ -73,6 +73,13 @@ def compute_mask_centroids(zarr_root, track_ids, frame_start, frame_end, downsam
             continue
         zarr_arr = zarr_root[arr_key]
         n_mask_frames = zarr_arr.shape[0]
+        # Masks may be stored at inference resolution; read stored video dims so
+        # centroids are returned in video-pixel coordinates, not mask-pixel coords.
+        _mask_h, _mask_w = zarr_arr.shape[1], zarr_arr.shape[2]
+        _vid_h = zarr_arr.attrs.get('video_height', _mask_h) or _mask_h
+        _vid_w = zarr_arr.attrs.get('video_width',  _mask_w) or _mask_w
+        _scale_y = _vid_h / _mask_h
+        _scale_x  = _vid_w / _mask_w
 
         for batch_start in range(frame_start, min(frame_end, n_mask_frames), _BATCH):
             batch_end = min(batch_start + _BATCH, frame_end, n_mask_frames)
@@ -87,8 +94,8 @@ def compute_mask_centroids(zarr_root, track_ids, frame_start, frame_end, downsam
             cy_ds = (mask * ys).sum(axis=(1, 2)) / np.maximum(count, 1)
             cx_ds = (mask * xs).sum(axis=(1, 2)) / np.maximum(count, 1)
 
-            cx_full = cx_ds * downsample
-            cy_full = cy_ds * downsample
+            cx_full = cx_ds * downsample * _scale_x
+            cy_full = cy_ds * downsample * _scale_y
 
             for i, frame_idx in enumerate(range(batch_start, batch_end)):
                 if count[i] > 0:
@@ -460,15 +467,18 @@ def run_tracklets(
         tp = output_path / f"tracklet_{label}_track{tid}_{preset}.mp4"
         writers[tid] = cv2.VideoWriter(str(tp), fourcc, fps, (size, size))
 
-    # Pre-compute downscale indices for overlay masks
+    # Pre-compute remap indices for overlay masks.
+    # Masks may be stored at inference resolution (smaller than the video frame),
+    # so we always build index arrays when mask dims differ from output dims.
     _y_idx = _x_idx = None
-    if also_overlay and draw_masks and scale != 1.0 and results.has_masks:
+    if also_overlay and draw_masks and results.has_masks:
         for tid in results.track_ids:
             arr_key = f"{tid}_masks"
             if arr_key in results.zarr_root:
                 _H, _W = results.zarr_root[arr_key].shape[1:3]
-                _y_idx = np.round(np.linspace(0, _H - 1, out_h)).astype(int)
-                _x_idx = np.round(np.linspace(0, _W - 1, out_w)).astype(int)
+                if _H != out_h or _W != out_w:
+                    _y_idx = np.round(np.linspace(0, _H - 1, out_h)).astype(int)
+                    _x_idx = np.round(np.linspace(0, _W - 1, out_w)).astype(int)
                 break
 
     _BATCH = 500
@@ -712,15 +722,18 @@ def run_render(
     overlay_out = output_path / f"overlay_{preset}.mp4"
     writer = cv2.VideoWriter(str(overlay_out), fourcc, fps, (out_w, out_h))
 
-    # Pre-compute downscale indices for masks
+    # Pre-compute remap indices for masks.
+    # Masks may be stored at inference resolution (smaller than the video frame),
+    # so we always build index arrays when mask dims differ from output dims.
     _y_idx = _x_idx = None
-    if draw_masks and scale != 1.0 and results.has_masks:
+    if draw_masks and results.has_masks:
         for tid in results.track_ids:
             arr_key = f"{tid}_masks"
             if arr_key in results.zarr_root:
                 _H, _W = results.zarr_root[arr_key].shape[1:3]
-                _y_idx = np.round(np.linspace(0, _H - 1, out_h)).astype(int)
-                _x_idx = np.round(np.linspace(0, _W - 1, out_w)).astype(int)
+                if _H != out_h or _W != out_w:
+                    _y_idx = np.round(np.linspace(0, _H - 1, out_h)).astype(int)
+                    _x_idx = np.round(np.linspace(0, _W - 1, out_w)).astype(int)
                 break
 
     _BATCH = 500
