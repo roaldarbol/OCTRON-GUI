@@ -535,9 +535,6 @@ def run_tracklets(
     for tid, td in tracking_data.items():
         pos_lookup[tid] = {int(r["frame_idx"]): r for _, r in td["data"].iterrows()}
         bbox_lookup[tid] = {int(r["frame_idx"]): r for _, r in td["features"].iterrows()}
-        n = len(pos_lookup[tid])
-        skipped = " (skipped)" if min_track_frames > 0 and n < min_track_frames else ""
-        print(f"  Track {tid} ({td['label']}): {n} frames{skipped}")
 
     # Only include tracks that have at least one detection in [frame_start, frame_end).
     active_tids = [
@@ -545,18 +542,21 @@ def run_tracklets(
         if any(frame_start <= f < frame_end for f in pos_lookup.get(tid, {}))
     ]
     skipped_range = len(results.track_ids) - len(active_tids)
-    if skipped_range:
-        print(f"  Skipping {skipped_range} track(s) with no detections in frames {frame_start}–{frame_end}")
+    logger.info(
+        f"Tracks in range: {len(active_tids)}/{len(results.track_ids)}"
+        + (f" ({skipped_range} skipped — no detections in frames {frame_start}–{frame_end})" if skipped_range else "")
+    )
 
     render_tids = [
         tid for tid in active_tids
         if min_track_frames <= 0 or len(pos_lookup.get(tid, {})) >= min_track_frames
     ]
     if min_track_frames > 0:
-        print(f"  Keeping {len(render_tids)}/{len(active_tids)} tracks with ≥{min_track_frames} frames")
+        skipped_min = len(active_tids) - len(render_tids)
+        logger.info(f"Keeping {len(render_tids)}/{len(active_tids)} tracks with ≥{min_track_frames} frames ({skipped_min} skipped)")
 
     if mask_centroids and results.has_masks:
-        print("Computing mask centre-of-mass centroids...")
+        logger.info("Computing mask centre-of-mass centroids...")
         mask_cent = compute_mask_centroids(
             results.zarr_root, results.track_ids, frame_start, frame_end,
         )
@@ -569,7 +569,7 @@ def run_tracklets(
                     row["pos_y"] = cy
                     pos_lookup[tid][frame_idx] = row
                     replaced += 1
-        print(f"  Replaced {replaced} centroid(s) with mask CoM")
+        logger.info(f"Replaced {replaced} centroid(s) with mask CoM")
 
     if smooth_cutoff_hz and smooth_cutoff_hz > 0:
         butterworth_smooth_tracklet_positions(
@@ -591,8 +591,8 @@ def run_tracklets(
         max_w = int(np.ceil((feats["bbox_x_max"] - feats["bbox_x_min"]).max()))
         max_h = int(np.ceil((feats["bbox_y_max"] - feats["bbox_y_min"]).max()))
         if max(max_w, max_h) > size:
-            print(
-                f"Warning: track {tid} ({td['label']}) has bounding boxes up to "
+            logger.warning(
+                f"Track {tid} ({td['label']}) has bounding boxes up to "
                 f"{max_w}×{max_h} px, which exceeds size={size}. "
                 f"Consider --tracklet-size {max(max_w, max_h) + 20}."
             )
@@ -634,7 +634,7 @@ def run_tracklets(
         if _first is not None:
             _batch_start, _batch_end, _batch_masks = _first
 
-    print(f"Rendering {n_frames} tracklet frames | preset={preset} | size={size}px")
+    logger.info(f"Rendering {n_frames} tracklet frames | preset={preset} | size={size}px | {len(render_tids)} track(s)")
     cap = cv2.VideoCapture(str(src_path))
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
 
@@ -645,7 +645,7 @@ def run_tracklets(
     for i, frame_idx in enumerate(range(frame_start, frame_end)):
         ok, orig_frame = cap.read()
         if not ok:
-            print(f"\nWarning: could not read frame {frame_idx}, stopping early.")
+            logger.warning(f"Could not read frame {frame_idx}, stopping early.")
             break
 
         # Advance to next mask batch when current one is exhausted.
@@ -739,11 +739,11 @@ def run_tracklets(
             end="\r",
         )
 
-    print()
+    print()  # close the \r progress line
     cap.release()
     for w in writers.values():
         w.release()
-    print(f"Tracklet(s) saved → {output_path}")
+    logger.info(f"Tracklet(s) saved → {output_path}")
 
 
 def run_render(
