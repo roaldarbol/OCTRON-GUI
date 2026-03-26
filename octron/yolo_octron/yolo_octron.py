@@ -2900,13 +2900,33 @@ class YOLO_octron:
             # Compute napari scale for mask layers: masks stored at inference
             # resolution (retina_masks=False) must be scaled up to video-pixel
             # coordinates so they align with the video image layer.
+            # Account for letterbox padding: scale from content dimensions (not
+            # full padded mask dims) to avoid stretching the mask in napari.
             _mask_layer_scale = None
+            _mask_layer_translate = None
             if (yolo_results.mask_height and yolo_results.height and
                     yolo_results.mask_width and yolo_results.width):
-                _sy = yolo_results.height / yolo_results.mask_height
-                _sx = yolo_results.width  / yolo_results.mask_width
-                if abs(_sy - 1.0) > 1e-3 or abs(_sx - 1.0) > 1e-3:
+                _mh = yolo_results.mask_height
+                _mw = yolo_results.mask_width
+                _vh = yolo_results.height
+                _vw = yolo_results.width
+                _c_h = round(_vh * _mw / _vw)
+                if _c_h <= _mh:
+                    _c_w = _mw
+                    _p_y = (_mh - _c_h) // 2
+                    _p_x = 0
+                else:
+                    _c_h = _mh
+                    _c_w = round(_vw * _mh / _vh)
+                    _p_y = 0
+                    _p_x = (_mw - _c_w) // 2
+                _sy = _vh / _c_h
+                _sx = _vw / _c_w
+                if abs(_sy - 1.0) > 1e-3 or abs(_sx - 1.0) > 1e-3 or _p_y or _p_x:
                     _mask_layer_scale = (1, _sy, _sx)
+                    # Translate the mask so content aligns with the video layer
+                    # (negative offset: move content up/left by the padding amount)
+                    _mask_layer_translate = (0, -_p_y * _sy, -_p_x * _sx)
 
             # Add mask layers first (bottom)
             for track_id, label, color, napari_colormap, tracking_df, features_df, masks in results_per_track:
@@ -2919,6 +2939,7 @@ class YOLO_octron:
                         colormap=napari_colormap,
                         visible=True,
                         scale=_mask_layer_scale,
+                        translate=_mask_layer_translate,
                     )
             # Add track layers second (on top)
             for track_id, label, color, napari_colormap, tracking_df, features_df, masks in results_per_track:

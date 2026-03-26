@@ -295,6 +295,10 @@ def render(
         False, "--bbox-sizes",
         help="Report per-track bounding-box sizes to help choose --tracklet-size, then exit.",
     ),
+    debug: bool = typer.Option(
+        False, "--debug",
+        help="Enable DEBUG-level logging with per-stage timing (decode / blend / encode).",
+    ),
 ):
     """Render annotated video(s) from OCTRON prediction output."""
     from octron.tools.render import run_render, PRESETS, report_bbox_sizes
@@ -337,6 +341,7 @@ def render(
         tracklet_smooth_order=tracklet_smooth_order,
         tracklet_min_frames=tracklet_min_frames,
         tracklet_interpolate_max_gap=tracklet_interpolate,
+        debug=debug,
     )
 
 
