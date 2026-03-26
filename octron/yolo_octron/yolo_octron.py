@@ -1710,7 +1710,8 @@ class YOLO_octron:
                             f"Failed to find original index for track {track_id}, class {res_class}: {e}"
                         ) from e
 
-                    logger.debug(f'Matched\n{res_line} with\n{tracker_input[tracked_idx]}')
+                    if verbose:
+                        logger.debug(f'Matched\n{res_line} with\n{tracker_input[tracked_idx]}')
                     
         assert len(set(tracked_ids)) == len(tracked_ids), f'Duplicate track IDs found: {tracked_ids}'
         assert len(tracked_ids) == len(tracked_idxs), \
