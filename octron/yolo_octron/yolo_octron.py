@@ -2205,15 +2205,25 @@ class YOLO_octron:
             )
             decode_thread.start()
 
-            # Always keep the raw frame: boxmot validates img is np.ndarray even for
-            # IoU-only trackers (ByteTrack), and region_details needs it too.
-            _needs_frame = True
+            # Forward raw frames only when actually needed downstream:
+            # ReID trackers need them for appearance embeddings; region_details
+            # needs them for skimage regionprops intensity measurements.
+            # For IoU-only trackers (ByteTrack) without region_details this
+            # avoids passing ~2-6 MB frame arrays through two queues.
+            _needs_frame = is_reid or region_details
 
             from octron.yolo_octron.helpers.pipelined_predict import (
                 run_inference_worker,
+                run_tracker_worker,
                 INFER_DONE as _INFER_DONE,
+                TRACK_DONE as _TRACK_DONE,
             )
             results_queue = queue.Queue(maxsize=infer_batch_size * 4)
+            # tracking_queue sits between the tracker thread and the main consumer.
+            # The main thread only does data accumulation (~1 ms/frame) so a modest
+            # bound is enough to absorb any transient load spikes.
+            tracking_queue = queue.Queue(maxsize=64)
+
             inference_thread = threading.Thread(
                 target=run_inference_worker,
                 args=(
@@ -2226,62 +2236,48 @@ class YOLO_octron:
             )
             inference_thread.start()
 
+            # Tracker thread: GPU→CPU transfers + tracker.update() + map_detection_index.
+            # Runs concurrently with inference so the GPU never idles waiting for CPU tracking.
+            tracker_thread = threading.Thread(
+                target=run_tracker_worker,
+                args=(
+                    results_queue, tracking_queue, _INFER_DONE,
+                    tracker, is_segment, per_class, self.map_detection_index,
+                ),
+                daemon=True,
+            )
+            tracker_thread.start()
+
             _batch_count = 0
             _t_frame = time.time()
             while True:
-                item = results_queue.get()
+                item = tracking_queue.get()
                 if isinstance(item, Exception):
                     raise item
-                if item is _INFER_DONE:
+                if item is _TRACK_DONE:
                     break
 
-                frame_no, frame_idx, frame, result = item
+                frame_no  = item['frame_no']
+                frame_idx = item['frame_idx']
+                frame     = item['frame']
+                status    = item['status']
 
-                # Feed results to the tracker sequentially (tracker is stateful per-frame).
                 # try/finally ensures every frame is reported in the progress bar, even when
                 # a frame has no detections or no confirmed tracks (continue exits the try).
                 try:
-                    # Process the results first ...
-                    try:
-                        confidences = result.boxes.conf.cpu().numpy()
-                        classes = result.boxes.cls.cpu().numpy()
-                        label_names = tuple([result.names[int(r)] for r in result.boxes.cls.cpu().numpy()])
-                        boxes = result.boxes.xyxy.cpu().numpy()
-                        if is_segment:
-                            masks = result.masks.data.cpu().numpy()
-                        else:
-                            masks = None
-                    except AttributeError:
+                    if status == 'no_result':
                         _n_no_result += 1
                         continue
-
-                    # Pass things to the boxmot tracker
-                    # INPUT:  M X (x, y, x, y, conf, cls)
-                    tracker_input = np.hstack([boxes,
-                                               confidences[:,np.newaxis],
-                                               classes[:,np.newaxis],
-                                              ])
-                    tracking_result = tracker.update(tracker_input, frame)
-                    if tracking_result.shape[0] == 0:
+                    if status == 'no_track':
                         _n_no_track += 1
                         continue
 
-                    # Map tracking results to original detections
-                    tracked_ids, tracked_idxs = self.map_detection_index(tracker_input,
-                                                                         tracking_result,
-                                                                         per_class=per_class,
-                                                                         verbose=False,
-                                                                         )
-                    # Skip if no valid tracks found
-                    if not tracked_idxs:
-                        _n_no_track += 1
-                        continue
-
-                    # Filter all result arrays using tracked_box_indices
-                    tracked_confidences = confidences[tracked_idxs]
-                    tracked_label_names = [label_names[i] for i in tracked_idxs]
-                    tracked_boxes = boxes[tracked_idxs]
-                    tracked_masks = masks[tracked_idxs] if is_segment else [None] * len(tracked_idxs)
+                    tracked_ids         = item['tracked_ids']
+                    tracked_label_names = item['tracked_label_names']
+                    tracked_confidences = item['tracked_confidences']
+                    tracked_boxes       = item['tracked_boxes']
+                    tracked_masks       = item['tracked_masks']
+                    result_names        = item['result_names']
 
                     # Extract tracks
                     for track_id, label, conf, bbox, mask in zip(tracked_ids,
@@ -2337,7 +2333,7 @@ class YOLO_octron:
                                                 video_hash=''
                                                 )
                                 mask_store.attrs['label'] = label
-                                mask_store.attrs['classes'] = result.names
+                                mask_store.attrs['classes'] = result_names
                                 H, W = video_dict['height'], video_dict['width']
                                 mask_buffer_arrays[track_id] = np.empty((buffer_size, H, W), dtype='int8')
                                 mask_buffer_fills[track_id] = 0
@@ -2494,6 +2490,7 @@ class YOLO_octron:
 
             decode_thread.join()
             inference_thread.join()
+            tracker_thread.join()
 
             # Release the cached video copy as soon as the threads are done so
             # disk space is freed before CSV/zarr writing and before the next
