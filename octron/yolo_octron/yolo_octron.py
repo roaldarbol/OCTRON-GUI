@@ -1956,7 +1956,7 @@ class YOLO_octron:
             logger.debug(f'Processing video {video_index+1}/{total_videos}: {video_name}')
 
             # Check overwrite BEFORE loading the model to avoid unnecessary work
-            _pred_root = (Path(output_dir) if output_dir else video_path.parent) / 'octron_predictions'
+            _pred_root = Path(output_dir) if output_dir else video_path.parent / 'octron_predictions'
             save_dir = _pred_root / f"{video_path.stem}_{tracker_name}"
             if save_dir.exists() and overwrite:
                 shutil.rmtree(save_dir)

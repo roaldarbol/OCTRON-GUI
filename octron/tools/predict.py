@@ -21,22 +21,36 @@ def _is_network_path(path) -> bool:
 
 
 def _transfer_results(temp_root: Path, final_root: Path) -> None:
-    """Move completed octron_predictions/ sub-folders from *temp_root* to *final_root*.
+    """Move completed prediction sub-folders from *temp_root* to *final_root*.
 
-    Each video writes one sub-folder inside octron_predictions/.  We move them
-    one at a time so that a partial transfer (e.g. after interrupt) leaves as
-    many complete video results as possible on the destination.
+    When output_dir was given, predict_batch writes results directly under
+    temp_root (no octron_predictions/ level).  When output_dir was not given,
+    results are nested under temp_root/octron_predictions/ and must be moved
+    to final_root/octron_predictions/.  We detect which layout was used and
+    move folders one at a time so a partial transfer leaves as many complete
+    video results as possible on the destination.
     """
-    src = temp_root / "octron_predictions"
-    if not src.exists():
-        return
-    dst_parent = final_root / "octron_predictions"
-    dst_parent.mkdir(parents=True, exist_ok=True)
-    for item in sorted(src.iterdir()):
-        dst = dst_parent / item.name
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.move(str(item), str(dst))
+    src_nested = temp_root / "octron_predictions"
+    if src_nested.exists():
+        # No output_dir: preserve octron_predictions/ structure alongside videos.
+        dst_parent = final_root / "octron_predictions"
+        dst_parent.mkdir(parents=True, exist_ok=True)
+        for item in sorted(src_nested.iterdir()):
+            dst = dst_parent / item.name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.move(str(item), str(dst))
+    else:
+        # output_dir given: results are directly under temp_root.
+        # Skip the 'videos' sub-dir used by the video cache.
+        final_root.mkdir(parents=True, exist_ok=True)
+        for item in sorted(temp_root.iterdir()):
+            if item.name == "videos":
+                continue
+            dst = final_root / item.name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.move(str(item), str(dst))
 
 
 def run_predict(
@@ -291,7 +305,12 @@ def run_predict(
                 _close_progress()
                 logger.info(f"Video {vidx}/{total_v}: {video_name}")
                 logger.info(f"Frames:   {num_frames:,}")
-                logger.info(f"Output:   {save_dir if not _temp_dir else str(_final_output_dir / Path(save_dir).name)}")
+                _display_out = (
+                    str(_final_output_dir / Path(save_dir).name)
+                    if _temp_dir and _final_output_dir
+                    else save_dir
+                )
+                logger.info(f"Output:   {_display_out}")
                 continue
 
             if stage == "skipped_video":
