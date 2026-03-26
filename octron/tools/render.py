@@ -294,7 +294,8 @@ def butterworth_smooth_tracklet_positions(pos_lookup, fps, cutoff_hz=2.0, order=
             row["pos_y"] = ys_smooth[i]
             pos_lookup[tid][f] = row
 
-    print(f"Tracklet centroids smoothed (Butterworth order={order}, cutoff={cutoff_hz} Hz)")
+    from loguru import logger
+    logger.info(f"Tracklet centroids smoothed (Butterworth order={order}, cutoff={cutoff_hz} Hz)")
     return pos_lookup
 
 
@@ -354,7 +355,8 @@ def interpolate_tracklet_gaps(pos_lookup, max_gap):
                 total_filled += 1
 
     if total_filled:
-        print(f"Tracklet gaps interpolated (cubic spline, max_gap={max_gap}): {total_filled} frame(s) filled")
+        from loguru import logger
+        logger.info(f"Tracklet gaps interpolated (cubic spline, max_gap={max_gap}): {total_filled} frame(s) filled")
     return pos_lookup
 
 
