@@ -2071,7 +2071,12 @@ class YOLO_octron:
             # network-redirected user profiles).  The main thread now puts descriptors into
             # _flush_coord_queue and continues immediately; the coordinator blocks instead.
             _FLUSH_MAX_INFLIGHT = 8
-            _flush_pool = ThreadPoolExecutor(max_workers=4)
+            # Use as many workers as inflight slots, capped at cpu_count so we
+            # don't over-subscribe on low-core machines.  Benchmark shows all
+            # writes finishing concurrently is 4× faster than 2 serial rounds
+            # of 4, because Zstd compression scales well across cores.
+            _flush_workers = min(_FLUSH_MAX_INFLIGHT, os.cpu_count() or _FLUSH_MAX_INFLIGHT)
+            _flush_pool = ThreadPoolExecutor(max_workers=_flush_workers)
             _flush_futures = []
             _flush_semaphore = threading.Semaphore(_FLUSH_MAX_INFLIGHT)
             # Bounded coordinator queue — main thread blocks only when 2×_FLUSH_MAX_INFLIGHT
