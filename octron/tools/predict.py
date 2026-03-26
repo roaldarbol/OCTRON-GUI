@@ -59,6 +59,7 @@ def run_predict(
     debug=False,
     zarr_cache=None,
     video_cache=None,
+    temp_dir=None,
 ):
     """
     Run YOLO prediction and tracking on one or more videos.
@@ -113,6 +114,11 @@ def run_predict(
         network read bottlenecks for high-resolution or high-bitrate videos.
         ``None`` (default) auto-enables when the input video path is a UNC /
         network path.  ``False`` suppresses auto-detection.
+    temp_dir : str or Path, optional
+        Parent directory for the cache temp folder.  Defaults to the system
+        temp dir (``tempfile.gettempdir()``).  Override with a path on a fast
+        local drive when the system temp dir is a network-redirected profile
+        folder (common in managed Windows environments).
     """
     from loguru import logger
     from octron.yolo_octron.yolo_octron import YOLO_octron
@@ -165,7 +171,10 @@ def run_predict(
     )
 
     if _do_zarr_cache or _do_video_cache:
-        _temp_dir = Path(tempfile.mkdtemp(prefix="octron_cache_"))
+        _mkdtemp_kwargs = {"prefix": "octron_cache_"}
+        if temp_dir is not None:
+            _mkdtemp_kwargs["dir"] = str(temp_dir)
+        _temp_dir = Path(tempfile.mkdtemp(**_mkdtemp_kwargs))
 
         # Belt-and-suspenders: also register an atexit handler so the temp dir
         # is cleaned up even if the process is killed before the finally block

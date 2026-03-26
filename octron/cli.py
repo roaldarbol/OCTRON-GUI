@@ -166,6 +166,7 @@ def predict(
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Directory where octron_predictions/ folders are written. Defaults to alongside each video file."),
     local_cache: Optional[bool] = typer.Option(None, "--local-cache/--no-local-cache", help="Cache zarr output to a local temp dir, then move to --output-dir when done. Avoids SMB atomic-write failures. Auto-enabled when --output-dir is a network/UNC path."),
     video_cache: Optional[bool] = typer.Option(None, "--video-cache/--no-video-cache", help="Copy each video to a local temp dir before decoding. Eliminates network read bottlenecks for high-resolution videos. Auto-enabled when the video path is a network/UNC path."),
+    temp_dir: Optional[Path] = typer.Option(None, "--temp-dir", help="Parent directory for the cache temp folder. Override when the system temp dir is a slow network-redirected profile (common in managed Windows environments). Example: D:\\temp"),
     debug: bool = typer.Option(False, "--debug", help="Enable debug logging (per-stage timing diagnostics)."),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
@@ -228,6 +229,7 @@ def predict(
         output_dir=output_dir,
         zarr_cache=local_cache,
         video_cache=video_cache,
+        temp_dir=temp_dir,
         debug=debug,
     )
 
