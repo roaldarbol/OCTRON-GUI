@@ -57,7 +57,8 @@ def run_predict(
     infer_batch_size=8,
     output_dir=None,
     debug=False,
-    cache=False,
+    zarr_cache=None,
+    video_cache=None,
 ):
     """
     Run YOLO prediction and tracking on one or more videos.
@@ -102,15 +103,16 @@ def run_predict(
         each video file.
     debug : bool
         Enable DEBUG-level logging (per-stage timing diagnostics).
-    cache : bool
-        Copy each video to a local temp directory before decoding, and write
-        zarr output there too before moving it to *output_dir*.  Eliminates
-        SMB / network-share bottlenecks for both read (video decode) and write
-        (zarr atomic rename).  Automatically enabled when *output_dir* or any
-        input video path is a UNC / network path
-        (``\\\\server\\share`` or ``//server/share``).
-        The temp directory is always deleted on exit, whether prediction
-        finishes normally, is interrupted, or crashes.
+    zarr_cache : bool or None
+        Cache zarr output to a local temp dir, then move to *output_dir* when
+        each video finishes.  Avoids SMB atomic-write (os.replace) failures on
+        network shares.  ``None`` (default) auto-enables when *output_dir* is a
+        UNC / network path.  ``False`` suppresses auto-detection.
+    video_cache : bool or None
+        Copy each video to a local temp dir before decoding.  Eliminates
+        network read bottlenecks for high-resolution or high-bitrate videos.
+        ``None`` (default) auto-enables when the input video path is a UNC /
+        network path.  ``False`` suppresses auto-detection.
     """
     from loguru import logger
     from octron.yolo_octron.yolo_octron import YOLO_octron
@@ -125,13 +127,13 @@ def run_predict(
     yolo = YOLO_octron()
 
     # --- local-cache setup ---------------------------------------------------
-    # Two reasons to cache locally:
-    # 1. Zarr uses atomic-write (write tmp, then os.replace) which fails on SMB
-    #    / network shares on Windows — zarr output must go to a local temp dir.
-    # 2. NVDEC still reads the compressed bitstream over the network; copying
-    #    the video locally first eliminates the SMB read bottleneck.
-    # Both are handled via a single temp dir: videos/ for input, the root for
-    # zarr output (octron_predictions/ sub-folder created inside it).
+    # zarr_cache: write zarr output to a local temp dir, then move to output_dir.
+    #   Required on SMB/network shares because zarr uses os.replace() which
+    #   fails on Windows SMB.  Auto-enabled when output_dir is a network path.
+    # video_cache: copy the video file locally before the decode thread opens
+    #   it.  Eliminates network read bottlenecks for large/high-res videos.
+    #   Auto-enabled when the input video path is a network path.
+    # Both share a single temp dir to keep cleanup simple.
     _temp_dir: Path | None = None
     _final_output_dir = Path(output_dir) if output_dir is not None else None
 
@@ -143,18 +145,21 @@ def run_predict(
     else:
         _video_list = []  # dict format (GUI): skip auto-detection on video paths
 
-    _needs_cache = (
-        cache
-        or (_final_output_dir is not None and _is_network_path(_final_output_dir))
-        or any(_is_network_path(v) for v in _video_list)
+    # Resolve each cache flag: explicit True/False overrides auto-detection;
+    # None means "decide based on path".
+    _do_zarr_cache: bool = (
+        zarr_cache
+        if zarr_cache is not None
+        else (_final_output_dir is not None and _is_network_path(_final_output_dir))
+    )
+    _do_video_cache: bool = (
+        video_cache
+        if video_cache is not None
+        else any(_is_network_path(v) for v in _video_list)
     )
 
-    if _needs_cache:
+    if _do_zarr_cache or _do_video_cache:
         _temp_dir = Path(tempfile.mkdtemp(prefix="octron_cache_"))
-        effective_output_dir = str(_temp_dir)
-        _dest_label = str(_final_output_dir) if _final_output_dir else "(alongside videos)"
-        logger.info(f"Local cache:  {_temp_dir}")
-        logger.info(f"Destination:  {_dest_label}")
 
         # Belt-and-suspenders: also register an atexit handler so the temp dir
         # is cleaned up even if the process is killed before the finally block
@@ -164,6 +169,16 @@ def run_predict(
                 shutil.rmtree(_temp_dir, ignore_errors=True)
 
         atexit.register(_atexit_cleanup)
+
+        if _do_zarr_cache:
+            effective_output_dir = str(_temp_dir)
+            _dest_label = str(_final_output_dir) if _final_output_dir else "(alongside videos)"
+            logger.info(f"Zarr cache:   {_temp_dir}  →  {_dest_label}")
+        else:
+            effective_output_dir = output_dir
+
+        if _do_video_cache:
+            logger.info(f"Video cache:  {_temp_dir / 'videos'}")
     else:
         effective_output_dir = output_dir
     # -------------------------------------------------------------------------
@@ -195,7 +210,7 @@ def run_predict(
 
     def _flush_cache(label: str = "") -> None:
         """Transfer completed results from the local cache to the destination."""
-        if _temp_dir is None or _final_output_dir is None:
+        if not _do_zarr_cache or _temp_dir is None or _final_output_dir is None:
             return
         _close_progress()
         _t0 = time.time()
@@ -222,7 +237,7 @@ def run_predict(
             region_properties=region_properties,
             infer_batch_size=infer_batch_size,
             output_dir=effective_output_dir,
-            video_cache_dir=str(_temp_dir / "videos") if _temp_dir is not None else None,
+            video_cache_dir=str(_temp_dir / "videos") if _do_video_cache and _temp_dir is not None else None,
         ):
             stage = progress.get("stage", "")
 
