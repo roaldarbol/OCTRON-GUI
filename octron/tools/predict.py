@@ -150,7 +150,10 @@ def run_predict(
     _do_zarr_cache: bool = (
         zarr_cache
         if zarr_cache is not None
-        else (_final_output_dir is not None and _is_network_path(_final_output_dir))
+        else (
+            (_final_output_dir is not None and _is_network_path(_final_output_dir))
+            or (_final_output_dir is None and any(_is_network_path(v) for v in _video_list))
+        )
     )
     _do_video_cache: bool = (
         video_cache
