@@ -2063,10 +2063,22 @@ class YOLO_octron:
             # _flush_semaphore limits how many write tasks may be in-flight (queued + running)
             # at once.  Each pending task holds a (buffer_size × H × W) data copy in RAM;
             # without backpressure the queue can grow to hundreds of entries → OOM.
+            #
+            # A dedicated flush coordinator thread decouples semaphore acquisition from the
+            # main consumer thread.  Previously _flush_semaphore.acquire() blocked the main
+            # thread directly, causing periodic stalls (one per buffer_size frames per track)
+            # whenever zarr writes were slower than the pipeline (e.g. on slow temp dirs or
+            # network-redirected user profiles).  The main thread now puts descriptors into
+            # _flush_coord_queue and continues immediately; the coordinator blocks instead.
             _FLUSH_MAX_INFLIGHT = 8
             _flush_pool = ThreadPoolExecutor(max_workers=4)
             _flush_futures = []
             _flush_semaphore = threading.Semaphore(_FLUSH_MAX_INFLIGHT)
+            # Bounded coordinator queue — main thread blocks only when 2×_FLUSH_MAX_INFLIGHT
+            # buffers are simultaneously queued+in-flight (prevents unbounded memory growth
+            # when writes are slower than accumulation).
+            _flush_coord_queue = queue.Queue(maxsize=2 * _FLUSH_MAX_INFLIGHT)
+            _FLUSH_COORD_DONE = object()
 
             def _write_to_zarr(semaphore, mask_store, frame_indices, data):
                 """Background task: write mask data to zarr and release semaphore slot.
@@ -2074,22 +2086,43 @@ class YOLO_octron:
                 are written once per track at the end of the video instead, avoiding
                 repeated read-modify-sort-write of a growing JSON list on every flush."""
                 try:
+                    _t0 = time.perf_counter()
                     mask_store[frame_indices, :, :] = data
+                    logger.debug(
+                        f"[zarr]   {(time.perf_counter()-_t0)*1000:.0f} ms  "
+                        f"{len(frame_indices)} frames"
+                    )
                 finally:
                     semaphore.release()
 
+            def _flush_coordinator():
+                """Coordinator thread: acquires semaphore slot then submits zarr writes.
+
+                Separating the acquire() from the main consumer thread means the main
+                thread is never stalled by slow zarr I/O — it puts items into the
+                coordinator queue (bounded, rarely blocks) and continues immediately.
+                """
+                while True:
+                    item = _flush_coord_queue.get()
+                    if item is _FLUSH_COORD_DONE:
+                        break
+                    mask_store, frame_indices, data_view = item
+                    _flush_semaphore.acquire()  # backpressure: blocks coordinator, not main thread
+                    future = _flush_pool.submit(
+                        _write_to_zarr, _flush_semaphore,
+                        mask_store, frame_indices, data_view,
+                    )
+                    _flush_futures.append(future)
+
+            _flush_coord_thread = threading.Thread(target=_flush_coordinator, daemon=True)
+            _flush_coord_thread.start()
+
             def _flush_mask_buffer(track_id):
-                """Hand the filled buffer directly to the write task; re-allocate lazily.
+                """Hand the filled buffer to the coordinator; re-allocate lazily.
 
-                Avoids the double-allocation that the previous .copy() approach caused:
-                copying a (buffer_size × H × W) int8 array allocates a second equally-
-                large block while the original is still live, which triggers OOM on
-                high-resolution videos after many flush/re-alloc cycles fragment the heap.
-
-                Instead, we pop the buffer out of the dict (so future detections trigger
-                a fresh lazy allocation) and pass a view [:n] to the write task.  The view
-                keeps the underlying array alive until zarr has consumed it — zero extra
-                allocation at flush time.
+                The main thread never blocks on zarr I/O — it puts a descriptor onto
+                the coordinator queue and returns immediately.  The coordinator thread
+                handles semaphore acquisition and pool submission.
                 """
                 n = mask_buffer_fills.get(track_id, 0)
                 if n == 0:
@@ -2103,14 +2136,9 @@ class YOLO_octron:
                 mask_buffer_fills[track_id] = 0
                 mask_buffer_frame_idxs[track_id] = []
                 mask_buffer_frame_map[track_id] = {}
-                # Block if too many writes are already queued — deliberate backpressure that
-                # prevents unlimited accumulation of (buffer_size × H × W) arrays in the queue.
-                _flush_semaphore.acquire()
-                future = _flush_pool.submit(
-                    _write_to_zarr, _flush_semaphore,
-                    mask_stores[track_id], frame_indices, data_buf[:n],
-                )
-                _flush_futures.append(future)
+                # Hand off to coordinator (blocks only if 2×_FLUSH_MAX_INFLIGHT buffers
+                # are simultaneously queued — a deliberate OOM guard).
+                _flush_coord_queue.put((mask_stores[track_id], frame_indices, data_buf[:n]))
             
             # Pipelined batched inference:
             # A background thread pre-reads frames into a bounded queue so the GPU
@@ -2473,6 +2501,9 @@ class YOLO_octron:
             if is_segment:
                 for track_id in all_ids:
                     _flush_mask_buffer(track_id)
+                # Stop coordinator: signal done, wait for all pending submissions to finish
+                _flush_coord_queue.put(_FLUSH_COORD_DONE)
+                _flush_coord_thread.join()
                 # Block until all async zarr writes have landed before writing metadata
                 for fut in _flush_futures:
                     fut.result()
