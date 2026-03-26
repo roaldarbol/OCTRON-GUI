@@ -642,11 +642,24 @@ def run_tracklets(
     _frame_times = deque(maxlen=30)
     _t_frame = time.time()
 
+    # Debug timing accumulators
+    if debug:
+        _dbg_n = 0
+        _dbg_t_decode = _dbg_t_queue = _dbg_t_blend = _dbg_t_crop = 0.0
+        _dbg_next_report = time.perf_counter() + 2.0
+
     for i, frame_idx in enumerate(range(frame_start, frame_end)):
+        if debug:
+            _t0 = time.perf_counter()
+
         ok, orig_frame = cap.read()
         if not ok:
             logger.warning(f"Could not read frame {frame_idx}, stopping early.")
             break
+
+        if debug:
+            _t1 = time.perf_counter()
+            _dbg_t_decode += _t1 - _t0
 
         # Advance to next mask batch when current one is exhausted.
         if _mask_q is not None and frame_idx >= _batch_end:
@@ -657,6 +670,10 @@ def run_tracklets(
                 _batch_masks = {}
 
         j = frame_idx - _batch_start if _batch_start >= 0 else 0
+
+        if debug:
+            _t2 = time.perf_counter()
+            _dbg_t_queue += _t2 - _t1
 
         # Build overlay frame if requested
         out_frame = None
@@ -707,6 +724,10 @@ def run_tracklets(
                         cv2.rectangle(out_frame, (x1 - 1, y1 - 1), (x2 + 1, y2 + 1), (0, 0, 0), lw)
                         cv2.rectangle(out_frame, (x1, y1), (x2, y2), color_bgr, lw)
 
+        if debug:
+            _t3 = time.perf_counter()
+            _dbg_t_blend += _t3 - _t2
+
         # Crop each track
         for tid in render_tids:
             row = pos_lookup.get(tid, {}).get(frame_idx)
@@ -722,6 +743,23 @@ def run_tracklets(
             else:
                 crop = np.zeros((size, size, 3), dtype=np.uint8)
             writers[tid].write(crop)
+
+        if debug:
+            _t4 = time.perf_counter()
+            _dbg_t_crop += _t4 - _t3
+            _dbg_n += 1
+            now_pc = _t4
+            if now_pc >= _dbg_next_report and _dbg_n > 0:
+                logger.debug(
+                    f"[decode] {_dbg_t_decode/_dbg_n*1000:.1f}ms  "
+                    f"[queue-wait] {_dbg_t_queue/_dbg_n*1000:.1f}ms  "
+                    f"[blend] {_dbg_t_blend/_dbg_n*1000:.1f}ms  "
+                    f"[crop+write] {_dbg_t_crop/_dbg_n*1000:.1f}ms  "
+                    f"(avg over {_dbg_n} frames)"
+                )
+                _dbg_n = 0
+                _dbg_t_decode = _dbg_t_queue = _dbg_t_blend = _dbg_t_crop = 0.0
+                _dbg_next_report = now_pc + 2.0
 
         now = time.time()
         _frame_times.append(now - _t_frame)
