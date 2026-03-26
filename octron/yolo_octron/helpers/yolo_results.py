@@ -166,7 +166,7 @@ class YOLO_results:
         store = zarr.storage.LocalStore(self.zarr, read_only=False)
         root = zarr.open_group(store=store, mode='a')
         if self.verbose:
-            logger.debug("Existing keys in zarr archive: %s", natsorted(root.array_keys()))
+            logger.debug("Existing keys in zarr archive: {}", natsorted(root.array_keys()))
         self.zarr_root = root
         self.has_masks = any(k.endswith('_masks') for k in root.array_keys())
         

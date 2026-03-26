@@ -62,6 +62,55 @@ def _open_ffmpeg_writer(output_path, fps, width, height, encoder):
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
+def _start_mask_prefetch(
+    zarr_root, track_ids, frame_start, frame_end, batch_size, y_idx, x_idx
+):
+    """
+    Start a background thread that pre-loads zarr mask batches into a queue.
+
+    Returns a ``queue.Queue`` that yields ``(batch_start, batch_end, masks_dict)``
+    tuples in order, followed by a ``None`` sentinel when all batches are done.
+
+    Using ``maxsize=2`` means the thread runs at most one batch ahead of the
+    consumer, bounding peak RAM usage while hiding I/O latency.
+    """
+    import threading
+    import queue as _queue_module
+    import numpy as np
+    import time
+    from loguru import logger
+
+    q = _queue_module.Queue(maxsize=2)
+
+    def _worker():
+        for bs in range(frame_start, frame_end, batch_size):
+            be = min(bs + batch_size, frame_end)
+            t0 = time.perf_counter()
+            masks = {}
+            for tid in track_ids:
+                arr_key = f"{tid}_masks"
+                if arr_key not in zarr_root:
+                    continue
+                zarr_arr = zarr_root[arr_key]
+                end_idx = min(be, zarr_arr.shape[0])
+                if bs >= end_idx:
+                    continue
+                raw = np.asarray(zarr_arr[bs:end_idx])
+                if y_idx is not None:
+                    raw = raw[:, y_idx[:, None], x_idx[None, :]]
+                masks[tid] = raw
+            dt_ms = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                f"[mask_load] batch {bs}–{be} ({len(masks)} tracks) in {dt_ms:.1f}ms"
+            )
+            q.put((bs, be, masks))
+        q.put(None)  # sentinel — no more batches
+
+    t = threading.Thread(target=_worker, daemon=True, name="mask-prefetch")
+    t.start()
+    return q
+
+
 def _letterbox_bounds(mask_h, mask_w, vid_h, vid_w):
     """
     Compute the video-content region within a mask stored at inference resolution.
@@ -561,9 +610,23 @@ def run_tracklets(
                     _x_idx = np.round(_p_x + np.linspace(0, _c_w - 1, out_w)).astype(int)
                 break
 
-    _BATCH = 500
+    _BATCH = 100
     _batch_masks = {}
-    _batch_start = None
+    _batch_start = -1
+    _batch_end = -1
+
+    # Start background zarr prefetch thread when overlay masks are needed.
+    _mask_q = None
+    if also_overlay and draw_masks and results.has_masks:
+        logger.info("Starting mask prefetch thread...")
+        _mask_q = _start_mask_prefetch(
+            results.zarr_root, results.track_ids,
+            frame_start, frame_end, _BATCH,
+            _y_idx, _x_idx,
+        )
+        _first = _mask_q.get(timeout=120)
+        if _first is not None:
+            _batch_start, _batch_end, _batch_masks = _first
 
     print(f"Rendering {n_frames} tracklet frames | preset={preset} | size={size}px")
     cap = cv2.VideoCapture(str(src_path))
@@ -579,26 +642,15 @@ def run_tracklets(
             print(f"\nWarning: could not read frame {frame_idx}, stopping early.")
             break
 
-        # Lazy-load overlay mask batches when needed
-        if also_overlay and draw_masks and results.has_masks \
-                and (_batch_start is None or frame_idx >= _batch_start + _BATCH):
-            _batch_start = frame_idx
-            _batch_end = min(_batch_start + _BATCH, frame_end)
-            _batch_masks = {}
-            for tid in results.track_ids:
-                arr_key = f"{tid}_masks"
-                if arr_key not in results.zarr_root:
-                    continue
-                zarr_arr = results.zarr_root[arr_key]
-                end_idx = min(_batch_end, zarr_arr.shape[0])
-                if _batch_start >= end_idx:
-                    continue
-                raw = np.asarray(zarr_arr[_batch_start:end_idx])
-                if _y_idx is not None:
-                    raw = raw[:, _y_idx[:, None], _x_idx[None, :]]
-                _batch_masks[tid] = raw
+        # Advance to next mask batch when current one is exhausted.
+        if _mask_q is not None and frame_idx >= _batch_end:
+            _item = _mask_q.get(timeout=120)
+            if _item is not None:
+                _batch_start, _batch_end, _batch_masks = _item
+            else:
+                _batch_masks = {}
 
-        j = frame_idx - _batch_start if _batch_start is not None else 0
+        j = frame_idx - _batch_start if _batch_start >= 0 else 0
 
         # Build overlay frame if requested
         out_frame = None
@@ -838,14 +890,34 @@ def run_render(
                     _x_idx = np.round(_p_x + np.linspace(0, _c_w - 1, out_w)).astype(int)
                 break
 
-    _BATCH = 500
+    # Batch size for zarr mask reads.  100 frames balances first-frame latency
+    # (~1–7s on network) against memory usage; the prefetch thread ensures the
+    # next batch is ready before the current one is exhausted.
+    _BATCH = 100
     _batch_masks = {}
-    _batch_start = None
+    _batch_start = -1
+    _batch_end = -1
 
     logger.info(
         f"Rendering {n_frames} frames | preset={preset} | scale={scale:.0%} "
         f"| output {out_w}×{out_h} px"
     )
+
+    # Start background zarr prefetch thread (only when masks are present).
+    _mask_q = None
+    if draw_masks and results.has_masks:
+        logger.info("Starting mask prefetch thread...")
+        _mask_q = _start_mask_prefetch(
+            results.zarr_root, results.track_ids,
+            frame_start, frame_end, _BATCH,
+            _y_idx, _x_idx,
+        )
+        # Pull first batch — blocks for initial load (batch_size frames only)
+        _first = _mask_q.get(timeout=120)
+        if _first is not None:
+            _batch_start, _batch_end, _batch_masks = _first
+            logger.debug(f"[mask_load] first batch ready: frames {_batch_start}–{_batch_end}")
+
     cap = cv2.VideoCapture(str(src_path))
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
 
@@ -856,7 +928,7 @@ def run_render(
     # Debug timing accumulators
     if debug:
         _dbg_n = 0
-        _dbg_t_decode = _dbg_t_batch = _dbg_t_blend = _dbg_t_encode = 0.0
+        _dbg_t_decode = _dbg_t_queue = _dbg_t_blend = _dbg_t_encode = 0.0
         _dbg_next_report = time.time() + 2.0
 
     for i, frame_idx in enumerate(range(frame_start, frame_end)):
@@ -872,34 +944,22 @@ def run_render(
             _t1 = time.perf_counter()
             _dbg_t_decode += _t1 - _t0
 
-        if draw_masks and results.has_masks \
-                and (_batch_start is None or frame_idx >= _batch_start + _BATCH):
-            _tb0 = time.perf_counter() if debug else None
-            _batch_start = frame_idx
-            _batch_end = min(_batch_start + _BATCH, frame_end)
-            _batch_masks = {}
-            for tid in results.track_ids:
-                arr_key = f"{tid}_masks"
-                if arr_key not in results.zarr_root:
-                    continue
-                zarr_arr = results.zarr_root[arr_key]
-                end_idx = min(_batch_end, zarr_arr.shape[0])
-                if _batch_start >= end_idx:
-                    continue
-                raw = np.asarray(zarr_arr[_batch_start:end_idx])
-                if _y_idx is not None:
-                    raw = raw[:, _y_idx[:, None], _x_idx[None, :]]
-                _batch_masks[tid] = raw
-            if debug and _tb0 is not None:
-                logger.debug(
-                    f"[mask_batch] loaded frames {_batch_start}–{_batch_end} "
-                    f"({len(_batch_masks)} tracks) in {(time.perf_counter()-_tb0)*1000:.1f}ms"
-                )
+        # Advance to next mask batch when the current one is exhausted.
+        # The prefetch thread already has the next batch loading in the background,
+        # so queue.get() returns almost instantly in the common case.
+        # Any non-trivial wait here means zarr I/O is slower than rendering.
+        if _mask_q is not None and frame_idx >= _batch_end:
+            _item = _mask_q.get(timeout=120)
+            if _item is not None:
+                _batch_start, _batch_end, _batch_masks = _item
+            else:
+                _batch_masks = {}  # no more masks
 
-        j = frame_idx - _batch_start if _batch_start is not None else 0
+        j = frame_idx - _batch_start if _batch_start >= 0 else 0
 
         if debug:
             _t2 = time.perf_counter()
+            _dbg_t_queue += _t2 - _t1
 
         if scale != 1.0:
             frame_small = cv2.resize(orig_frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
@@ -965,12 +1025,13 @@ def run_render(
             if now >= _dbg_next_report and _dbg_n > 0:
                 logger.debug(
                     f"[decode] {_dbg_t_decode/_dbg_n*1000:.1f}ms  "
+                    f"[queue-wait] {_dbg_t_queue/_dbg_n*1000:.1f}ms  "
                     f"[blend] {_dbg_t_blend/_dbg_n*1000:.1f}ms  "
                     f"[encode] {_dbg_t_encode/_dbg_n*1000:.1f}ms  "
                     f"(avg over {_dbg_n} frames)"
                 )
                 _dbg_n = 0
-                _dbg_t_decode = _dbg_t_blend = _dbg_t_encode = 0.0
+                _dbg_t_decode = _dbg_t_queue = _dbg_t_blend = _dbg_t_encode = 0.0
                 _dbg_next_report = now + 2.0
 
         now = time.time()
