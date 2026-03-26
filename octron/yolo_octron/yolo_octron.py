@@ -2268,6 +2268,8 @@ class YOLO_octron:
             tracker_thread.start()
 
             _t_frame = time.time()
+            _consumer_t_window = _t_frame
+            _consumer_n_window = 0
             while True:
                 item = tracking_queue.get()
                 if isinstance(item, Exception):
@@ -2524,6 +2526,7 @@ class YOLO_octron:
                     now = time.time()
                     _frame_time = now - _t_frame
                     _t_frame = now
+                    _consumer_n_window += 1
                     yield {
                         'stage': 'processing',
                         'video_name': video_name,
@@ -2536,6 +2539,19 @@ class YOLO_octron:
                     # Prune completed zarr-write futures so the list stays small
                     if _flush_futures:
                         _flush_futures[:] = [f for f in _flush_futures if not f.done()]
+                    # Periodic consumer timing diagnostic
+                    if debug:
+                        _consumer_elapsed = now - _consumer_t_window
+                        if _consumer_elapsed >= 0.5 and _consumer_n_window > 0:
+                            _c_fps = _consumer_n_window / _consumer_elapsed
+                            _c_ms  = 1000.0 / _c_fps if _c_fps > 0 else 0.0
+                            logger.debug(
+                                f"[consumer]  {_c_ms:.1f} ms/frame  ({_c_fps:.0f} fps)"
+                                f"  track_q={tracking_queue.qsize()}"
+                                f"  n_tracks={len(all_ids)}"
+                            )
+                            _consumer_t_window = now
+                            _consumer_n_window = 0
 
             decode_thread.join()
             inference_thread.join()
