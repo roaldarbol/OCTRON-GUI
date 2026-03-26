@@ -62,11 +62,15 @@ def _open_ffmpeg_writer(output_path, fps, width, height, encoder):
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
-def _start_mask_prefetch(
-    zarr_root, track_ids, frame_start, frame_end, batch_size, y_idx, x_idx
-):
+def _start_mask_prefetch(zarr_root, track_ids, frame_start, frame_end, batch_size):
     """
     Start a background thread that pre-loads zarr mask batches into a queue.
+
+    Masks are stored at their native inference resolution (e.g. 640×384).
+    The remap to output resolution is applied per-frame in the blend loop so
+    that the prefetch thread never allocates more than
+    ``batch_size × n_tracks × inference_H × inference_W`` bytes at once
+    instead of ``batch_size × n_tracks × output_H × output_W``.
 
     Returns a ``queue.Queue`` that yields ``(batch_start, batch_end, masks_dict)``
     tuples in order, followed by a ``None`` sentinel when all batches are done.
@@ -95,10 +99,7 @@ def _start_mask_prefetch(
                 end_idx = min(be, zarr_arr.shape[0])
                 if bs >= end_idx:
                     continue
-                raw = np.asarray(zarr_arr[bs:end_idx])
-                if y_idx is not None:
-                    raw = raw[:, y_idx[:, None], x_idx[None, :]]
-                masks[tid] = raw
+                masks[tid] = np.asarray(zarr_arr[bs:end_idx])
             dt_ms = (time.perf_counter() - t0) * 1000
             logger.debug(
                 f"[mask_load] batch {bs}–{be} ({len(masks)} tracks) in {dt_ms:.1f}ms"
@@ -622,7 +623,6 @@ def run_tracklets(
         _mask_q = _start_mask_prefetch(
             results.zarr_root, results.track_ids,
             frame_start, frame_end, _BATCH,
-            _y_idx, _x_idx,
         )
         _first = _mask_q.get(timeout=120)
         if _first is not None:
@@ -660,7 +660,7 @@ def run_tracklets(
             else:
                 frame_small = orig_frame
 
-            # uint8 alpha blend: build color_layer then addWeighted (no float32 allocation)
+            # uint8 alpha blend: remap masks per-frame from inference resolution
             if draw_masks and results.has_masks and _batch_masks:
                 color_layer = frame_small.copy()
                 _drew_any = False
@@ -668,7 +668,11 @@ def run_tracklets(
                     if tid in _batch_masks:
                         batch = _batch_masks[tid]
                         if j < batch.shape[0]:
-                            obj = batch[j] == 1
+                            mask_row = batch[j]
+                            if _y_idx is not None:
+                                obj = mask_row[_y_idx[:, None], _x_idx[None, :]] == 1
+                            else:
+                                obj = mask_row == 1
                             if obj.any():
                                 color_layer[obj] = track_colors[tid]
                                 _drew_any = True
@@ -910,7 +914,6 @@ def run_render(
         _mask_q = _start_mask_prefetch(
             results.zarr_root, results.track_ids,
             frame_start, frame_end, _BATCH,
-            _y_idx, _x_idx,
         )
         # Pull first batch — blocks for initial load (batch_size frames only)
         _first = _mask_q.get(timeout=120)
@@ -925,11 +928,11 @@ def run_render(
     _frame_times = deque(maxlen=30)
     _t_frame = time.time()
 
-    # Debug timing accumulators
+    # Debug timing accumulators (all using perf_counter for consistency)
     if debug:
         _dbg_n = 0
         _dbg_t_decode = _dbg_t_queue = _dbg_t_blend = _dbg_t_encode = 0.0
-        _dbg_next_report = time.time() + 2.0
+        _dbg_next_report = time.perf_counter() + 2.0
 
     for i, frame_idx in enumerate(range(frame_start, frame_end)):
         if debug:
@@ -966,7 +969,9 @@ def run_render(
         else:
             frame_small = orig_frame
 
-        # uint8 alpha blend: build color_layer then addWeighted (no float32 allocation)
+        # uint8 alpha blend: masks stored at inference resolution are remapped
+        # to output resolution per-frame (not pre-expanded in the prefetch thread,
+        # which would allocate n_tracks × batch × output_H × output_W bytes).
         if draw_masks and results.has_masks and _batch_masks:
             color_layer = frame_small.copy()
             _drew_any = False
@@ -974,7 +979,11 @@ def run_render(
                 if tid in _batch_masks:
                     batch = _batch_masks[tid]
                     if j < batch.shape[0]:
-                        obj = batch[j] == 1
+                        mask_row = batch[j]  # inference resolution (e.g. 384×640)
+                        if _y_idx is not None:
+                            obj = mask_row[_y_idx[:, None], _x_idx[None, :]] == 1
+                        else:
+                            obj = mask_row == 1
                         if obj.any():
                             color_layer[obj] = track_colors[tid]
                             _drew_any = True
