@@ -291,7 +291,7 @@ def run_predict(
                 _close_progress()
                 logger.info(f"Video {vidx}/{total_v}: {video_name}")
                 logger.info(f"Frames:   {num_frames:,}")
-                logger.info(f"Output:   {save_dir if not _temp_dir else str(_final_output_dir / 'octron_predictions' / Path(save_dir).name)}")
+                logger.info(f"Output:   {save_dir if not _temp_dir else str(_final_output_dir / Path(save_dir).name)}")
                 continue
 
             if stage == "skipped_video":
