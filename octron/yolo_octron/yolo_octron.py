@@ -2072,15 +2072,26 @@ class YOLO_octron:
                     semaphore.release()
 
             def _flush_mask_buffer(track_id):
-                """Copy filled slice, release pre-alloc array, submit write with backpressure."""
+                """Hand the filled buffer directly to the write task; re-allocate lazily.
+
+                Avoids the double-allocation that the previous .copy() approach caused:
+                copying a (buffer_size × H × W) int8 array allocates a second equally-
+                large block while the original is still live, which triggers OOM on
+                high-resolution videos after many flush/re-alloc cycles fragment the heap.
+
+                Instead, we pop the buffer out of the dict (so future detections trigger
+                a fresh lazy allocation) and pass a view [:n] to the write task.  The view
+                keeps the underlying array alive until zarr has consumed it — zero extra
+                allocation at flush time.
+                """
                 n = mask_buffer_fills.get(track_id, 0)
                 if n == 0:
                     return
                 frame_indices = mask_buffer_frame_idxs[track_id][:n]
-                # .copy() on just the filled slice — avoids holding the full pre-allocated array
-                data = mask_buffer_arrays[track_id][:n].copy()
-                # Free the pre-allocated array immediately; re-allocated lazily on next detection.
-                del mask_buffer_arrays[track_id]
+                # Pop the buffer so future detections for this track trigger a lazy re-alloc.
+                # The view data_buf[:n] passed to the write task holds the array alive until
+                # zarr finishes — no copy needed.
+                data_buf = mask_buffer_arrays.pop(track_id)
                 # Reset immediately so new frames accumulate while the write runs
                 mask_buffer_fills[track_id] = 0
                 mask_buffer_frame_idxs[track_id] = []
@@ -2090,7 +2101,7 @@ class YOLO_octron:
                 _flush_semaphore.acquire()
                 future = _flush_pool.submit(
                     _write_to_zarr, _flush_semaphore,
-                    mask_stores[track_id], frame_indices, data,
+                    mask_stores[track_id], frame_indices, data_buf[:n],
                 )
                 _flush_futures.append(future)
             
