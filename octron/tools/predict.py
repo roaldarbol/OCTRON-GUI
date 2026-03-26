@@ -167,11 +167,7 @@ def run_predict(
             or (_final_output_dir is None and any(_is_network_path(v) for v in _video_list))
         )
     )
-    _do_video_cache: bool = (
-        video_cache
-        if video_cache is not None
-        else any(_is_network_path(v) for v in _video_list)
-    )
+    _do_video_cache: bool = video_cache if video_cache is not None else False
 
     if _do_zarr_cache or _do_video_cache:
         _mkdtemp_kwargs = {"prefix": "octron_cache_"}
