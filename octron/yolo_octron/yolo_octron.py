@@ -2115,11 +2115,17 @@ class YOLO_octron:
                         break
                     mask_store, frame_indices, data_view = item
                     _flush_semaphore.acquire()  # backpressure: blocks coordinator, not main thread
-                    future = _flush_pool.submit(
-                        _write_to_zarr, _flush_semaphore,
-                        mask_store, frame_indices, data_view,
-                    )
-                    _flush_futures.append(future)
+                    try:
+                        future = _flush_pool.submit(
+                            _write_to_zarr, _flush_semaphore,
+                            mask_store, frame_indices, data_view,
+                        )
+                        _flush_futures.append(future)
+                    except RuntimeError:
+                        # Pool shut down (interpreter exit after KeyboardInterrupt);
+                        # release the semaphore slot and stop quietly.
+                        _flush_semaphore.release()
+                        break
 
             _flush_coord_thread = threading.Thread(target=_flush_coordinator, daemon=True)
             _flush_coord_thread.start()

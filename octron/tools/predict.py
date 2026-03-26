@@ -144,13 +144,16 @@ def run_predict(
     #   Auto-enabled when the input video path is a network path.
     # Both share a single temp dir to keep cleanup simple.
     _temp_dir: Path | None = None
-    _final_output_dir = Path(output_dir) if output_dir is not None else None
+    # Resolve to absolute path so that relative paths under a network working
+    # directory (e.g. "data/tracking/" when cwd is \\server\share\...) are
+    # correctly identified as network paths by _is_network_path().
+    _final_output_dir = Path(output_dir).resolve() if output_dir is not None else None
 
     # Normalise videos to a flat list of Paths for network-path detection.
     if isinstance(videos, (str, Path)):
-        _video_list: list[Path] = [Path(videos)]
+        _video_list: list[Path] = [Path(videos).resolve()]
     elif isinstance(videos, list):
-        _video_list = [Path(v) for v in videos]
+        _video_list = [Path(v).resolve() for v in videos]
     else:
         _video_list = []  # dict format (GUI): skip auto-detection on video paths
 
