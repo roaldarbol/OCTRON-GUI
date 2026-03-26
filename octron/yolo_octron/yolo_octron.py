@@ -2000,7 +2000,12 @@ class YOLO_octron:
             #     retina_masks = False
             # else:
             #     retina_masks = True
-            retina_masks = True if is_segment else False
+            # retina_masks=False: YOLO returns masks at inference resolution
+            # (e.g. 640×360 for a 4K video at imgsz=640) instead of upsampling
+            # to full video resolution.  Masks are stored at inference resolution
+            # in zarr, which is 9–36× smaller for high-res footage.  The render
+            # pipeline upsamples on read via nearest-neighbour index mapping.
+            retina_masks = False
             
             save_dir.mkdir(parents=True, exist_ok=True)
             
@@ -2334,10 +2339,15 @@ class YOLO_octron:
                         if not track_id in all_ids:
                             # Initialize mask store (only for segmentation models)
                             if is_segment:
-                                video_shape = (video_dict['num_frames'], video_dict['height'], video_dict['width'])
+                                # Use mask's own shape (inference resolution) rather than
+                                # video resolution.  retina_masks=False means ultralytics
+                                # returns masks at imgsz, e.g. 640×360 for 4K@imgsz=640,
+                                # which is 9–36× smaller than the full video frame.
+                                H_mask, W_mask = mask.shape
+                                mask_shape = (video_dict['num_frames'], H_mask, W_mask)
                                 mask_store = create_prediction_zarr(prediction_store,
                                                 f'{track_id}_masks',
-                                                shape=video_shape,
+                                                shape=mask_shape,
                                                 chunk_size=buffer_size,
                                                 fill_value=-1,
                                                 dtype='int8',
@@ -2345,8 +2355,11 @@ class YOLO_octron:
                                                 )
                                 mask_store.attrs['label'] = label
                                 mask_store.attrs['classes'] = result_names
-                                H, W = video_dict['height'], video_dict['width']
-                                mask_buffer_arrays[track_id] = np.empty((buffer_size, H, W), dtype='int8')
+                                # Record the original video resolution so loaders can
+                                # upsample masks back to video space when needed.
+                                mask_store.attrs['video_height'] = video_dict['height']
+                                mask_store.attrs['video_width'] = video_dict['width']
+                                mask_buffer_arrays[track_id] = np.empty((buffer_size, H_mask, W_mask), dtype='int8')
                                 mask_buffer_fills[track_id] = 0
                                 mask_buffer_frame_idxs[track_id] = []
                                 mask_buffer_frame_map[track_id] = {}
@@ -2401,7 +2414,7 @@ class YOLO_octron:
                                 mask = mask.astype('int8')
                             # Write into the pre-allocated buffer slot (re-allocate lazily if freed after last flush)
                             if track_id not in mask_buffer_arrays:
-                                H_buf, W_buf = video_dict['height'], video_dict['width']
+                                H_buf, W_buf = mask.shape  # inference resolution
                                 mask_buffer_arrays[track_id] = np.empty((buffer_size, H_buf, W_buf), dtype='int8')
                             slot = mask_buffer_fills[track_id]
                             mask_buffer_arrays[track_id][slot] = mask
