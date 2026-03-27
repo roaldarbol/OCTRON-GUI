@@ -258,6 +258,18 @@ def run_training(
         device = auto_device()
 
     # --- Steps 1–4: prepare and export training data (OCTRON projects only) ---
+    # Skip the expensive JSON-loading pipeline if training data is already on
+    # disk and the caller hasn't asked to overwrite it.  Preparing labels reads
+    # every object_organizer.json in the project, which can take a long time on
+    # large projects.  If the yolo_config.yaml is already present the data is
+    # ready to use; pass --overwrite to force regeneration.
+    if not skip_split and config_path.exists() and not overwrite:
+        print(
+            f"Training data already exists at {config_path.parent} — skipping data "
+            "preparation. Delete the training_data folder or use --overwrite to regenerate."
+        )
+        skip_split = True
+
     if not skip_split:
         run_split(
             project_path=project_path,
