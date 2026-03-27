@@ -127,18 +127,23 @@ def _validate_data_dir(data_dir: Path):
 
 
 def run_training(
+    # --- Data source ---
     project_path=None,
     data_dir: Optional[Path] = None,
-    output_dir: Optional[Path] = None,
-    run_name: Optional[str] = None,
+    # --- Model ---
     model="YOLO26m",
     train_mode=None,
-    device="auto",
+    # --- Core hyperparameters ---
     epochs=250,
     imagesz=640,
+    device="auto",
     save_period=50,
+    # --- Output control ---
+    output_dir: Optional[Path] = None,
+    run_name: Optional[str] = None,
     overwrite=False,
     resume=False,
+    # --- Data split (OCTRON projects only) ---
     skip_split=False,
     train_fraction=0.7,
     val_fraction=0.15,
@@ -162,6 +167,20 @@ def run_training(
         Path to an external YOLO training data directory. When provided,
         ``skip_split`` is implied and ``train_mode`` is read from
         ``yolo_config.yaml`` if not explicitly supplied.
+    model : str or Path
+        YOLO model name (e.g. 'YOLO11m') or path to an existing model file.
+    train_mode : str or None
+        'segment' or 'detect'. When ``None`` and ``data_dir`` is provided the
+        value is read from ``yolo_config.yaml``; falls back to 'segment'.
+    epochs : int
+        Number of training epochs.
+    imagesz : int
+        Input image size for training.
+    device : str
+        Device to train on ('auto', 'cpu', 'cuda', 'mps'). 'auto' selects
+        CUDA if available, then MPS, then CPU.
+    save_period : int
+        Save a checkpoint every N epochs.
     output_dir : Path, optional
         Base directory where the training run folder will be created.
         Defaults to ``<project_path>/model/`` or ``<data_dir>/model/``.
@@ -169,20 +188,8 @@ def run_training(
         Name of the training run subdirectory. When ``None`` the GUI default
         ``'training'`` is used, preserving existing behaviour. CLI callers
         should pass an informative name such as ``'yolo26m_seg_640_20260327'``.
-    model : str or Path
-        YOLO model name (e.g. 'YOLO11m') or path to an existing model file.
-    train_mode : str or None
-        'segment' or 'detect'. When ``None`` and ``data_dir`` is provided the
-        value is read from ``yolo_config.yaml``; falls back to 'segment'.
-    device : str
-        Device to train on ('auto', 'cpu', 'cuda', 'mps'). 'auto' selects
-        CUDA if available, then MPS, then CPU.
-    epochs : int
-        Number of training epochs.
-    imagesz : int
-        Input image size for training.
-    save_period : int
-        Save a checkpoint every N epochs.
+    overwrite : bool
+        Overwrite an existing trained model. Default: skip if best.pt exists.
     resume : bool
         Resume training from an existing last.pt checkpoint.
     skip_split : bool

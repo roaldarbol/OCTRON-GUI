@@ -113,22 +113,27 @@ def split(
 
 @app.command()
 def train(
+    # --- Data source ---
     project_path: Optional[Path] = typer.Argument(None, help="Path to the OCTRON project directory. Optional when --data-dir is provided."),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir", help="Path to an external YOLO training data directory containing yolo_config.yaml and train/val splits. Skips OCTRON data preparation."),
+    # --- Model ---
     model: YOLOModel = typer.Option(YOLOModel.yolo26m, help="YOLO model to train."),
     train_mode: Optional[TrainMode] = typer.Option(None, "--mode", help="Training mode (segment or detect). When --data-dir is used, defaults to the value in yolo_config.yaml."),
-    device: Device = typer.Option(Device.auto, help="Device to train on."),
+    # --- Core hyperparameters ---
     epochs: int = typer.Option(250, help="Number of training epochs."),
     imagesz: int = typer.Option(640, help="Input image size."),
+    device: Device = typer.Option(Device.auto, help="Device to train on."),
     save_period: int = typer.Option(50, help="Save a checkpoint every N epochs."),
+    # --- Output control ---
+    output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Base directory for training output. Defaults to <project>/model/ or <data-dir>/model/."),
+    run_name: Optional[str] = typer.Option(None, "--run-name", help="Name for this training run (subfolder inside output dir). Defaults to an auto-generated name encoding model, mode, image size, and date."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite an existing trained model. Default: skip if best.pt already exists."),
     resume: bool = typer.Option(False, help="Resume from an existing last.pt checkpoint. Use --run-name to target a specific previous run."),
+    # --- Data split (OCTRON projects only) ---
     no_split: bool = typer.Option(False, "--no-split", help="Skip data preparation. Use when 'octron split' has already been run."),
     train_fraction: float = typer.Option(0.7, "--train", help="Fraction of frames for training (ignored with --no-split or --data-dir)."),
     val_fraction: float = typer.Option(0.15, "--val", help="Fraction of frames for validation (ignored with --no-split or --data-dir)."),
     seed: int = typer.Option(88, "--seed", help="Random seed for the split (ignored with --no-split or --data-dir)."),
-    data_dir: Optional[Path] = typer.Option(None, "--data-dir", help="Path to an external YOLO training data directory containing yolo_config.yaml and train/val splits. Skips OCTRON data preparation."),
-    output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Base directory for training output. Defaults to <project>/model/ or <data-dir>/model/."),
-    run_name: Optional[str] = typer.Option(None, "--run-name", help="Name for this training run (subfolder inside output dir). Defaults to an auto-generated name encoding model, mode, image size, and date."),
 ):
     """Train a YOLO model on an OCTRON project or external YOLO-format data.
 
