@@ -1134,6 +1134,17 @@ class YOLO_octron:
             for callback_name in ['on_fit_epoch_end', 'on_train_start', 'on_train_end']:
                 if callback_name in self.model.callbacks:
                     self.model.callbacks.pop(callback_name, None)
+
+        # Callback to log the batch size chosen by ultralytics AutoBatch
+        def _on_train_start(trainer):
+            try:
+                chosen = getattr(trainer, 'batch_size', None)
+                if chosen is None:
+                    chosen = getattr(trainer.args, 'batch', None)
+                if chosen is not None:
+                    logger.info(f"Batch size: {chosen}")
+            except Exception:
+                pass
                     
         # Setup a queue to receive yielded values from the callback
         progress_queue = queue.Queue()
@@ -1265,6 +1276,7 @@ class YOLO_octron:
 
         self.model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
         self.model.add_callback("on_train_end", _on_train_end)
+        self.model.add_callback("on_train_start", _on_train_start)
         
         if self.config_path is None or not self.config_path.exists():
             raise FileNotFoundError(
@@ -1296,6 +1308,11 @@ class YOLO_octron:
                 logger.info(f"Starting training for {epochs} epochs...")
                 logger.info(f"Setting rect={rect} based on training image size of {img_width}x{img_height} (wxh)")
                 logger.info(f"Using device: {device}")
+                if batch == -1:
+                    logger.info(
+                        "Batch size: auto — ultralytics will probe VRAM to find the "
+                        "optimal size before the first epoch (may take a minute or two)."
+                    )
                 logger.info("################################################################")
                 # Build training kwargs — shared between segment and detect
                 # When rect=True, images in different batches have different padded heights
