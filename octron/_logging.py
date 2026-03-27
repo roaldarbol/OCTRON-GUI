@@ -33,17 +33,27 @@ class _InterceptHandler(logging.Handler):
         logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
 
 
-# Substrings found in known-noisy third-party WARNING messages.
-# These are suppressed in BOTH normal and debug mode: they are per-frame or
-# import-time side effects from third-party bugs and are never actionable.
-_SUPPRESSED_WARNING_SUBSTRINGS = (
+# Substrings found in third-party WARNING messages that are completely silent
+# (never shown, even on first occurrence).  These are per-frame or import-time
+# side effects that are never actionable and would flood the terminal.
+_ALWAYS_SUPPRESSED_SUBSTRINGS = (
     "json_encoders",              # pydantic v2 deprecation at napari import time
-    "argument 'device'",          # torch pin_memory() / is_pinned() — PyTorch 2.10 bug
-    "torch.jit.trace",            # torch.jit.trace / trace_method DeprecationWarning
     "trace to be incorrect",      # TracerWarning fired during AMP initialisation
     "already a ScriptModule",     # torch.jit UserWarning during AMP initialisation
     "'rect=True' is incompatible",  # ultralytics dataloader shuffle warning (expected)
 )
+
+# Substrings found in third-party WARNING messages that are shown only once
+# per session (first occurrence passes through; subsequent repeats are dropped).
+_SHOW_ONCE_SUBSTRINGS = (
+    "argument 'device'",          # torch pin_memory() / is_pinned() — PyTorch 2.10 bug
+    "torch.jit.trace",            # torch.jit.trace / trace_method DeprecationWarning
+)
+
+# Session-level set of warning message keys already shown once.
+# Keyed on the first 200 characters of the message to deduplicate repeats
+# across DataLoader thread restarts (where Python's __warningregistry__ resets).
+_shown_warnings: set = set()
 
 # Python logger name prefixes whose DEBUG/INFO records are always suppressed,
 # even in --debug mode.  These libraries produce high-volume messages that are
@@ -64,9 +74,10 @@ def _make_loguru_filter(debug: bool):
     """Return a loguru filter callable for the given verbosity mode.
 
     Both modes suppress:
-    - Known per-frame / import-time WARNING noise (pin_memory, TracerWarning,
-      pydantic json_encoders, …) — these fire thousands of times and are not
-      actionable; hiding them even in debug keeps progress bars readable.
+    - Known per-frame / import-time WARNING noise (TracerWarning, pydantic
+      json_encoders, …) — always silent because they fire thousands of times.
+    - Known per-epoch WARNING noise (pin_memory, torch.jit.trace) — shown once
+      per session, then suppressed on subsequent repetitions.
     - DEBUG/INFO from high-volume library loggers (matplotlib, PIL) — unrelated
       to octron and would break ``\\r\\033[K`` in-place progress-bar display.
 
@@ -75,17 +86,27 @@ def _make_loguru_filter(debug: bool):
     - Blocks all other INFO/DEBUG — suppresses the ultralytics architecture
       table, training-config dump, TensorBoard URL, scan progress bars, etc.
     """
-    substrings = _SUPPRESSED_WARNING_SUBSTRINGS
+    always_suppress = _ALWAYS_SUPPRESSED_SUBSTRINGS
+    show_once = _SHOW_ONCE_SUBSTRINGS
     noisy_prefixes = _NOISY_LIBRARY_PREFIXES
 
     def _filter(record) -> bool:
         level_no = record["level"].no
         name = record["name"]
+        message = record["message"]
 
-        # Always suppress per-frame WARNING noise (both normal and debug mode).
         if level_no == 30:  # WARNING
-            if any(s in record["message"] for s in substrings):
+            # Always-silent substrings — never shown.
+            if any(s in message for s in always_suppress):
                 return False
+
+            # Show-once substrings — first occurrence passes, repeats dropped.
+            if any(s in message for s in show_once):
+                key = message[:200]
+                if key in _shown_warnings:
+                    return False
+                _shown_warnings.add(key)
+                # fall through to show the first occurrence
 
         # Always suppress high-volume library debug spam that breaks progress bars.
         if level_no < 30 and any(name.startswith(p) for p in noisy_prefixes):

@@ -123,6 +123,7 @@ def train(
     epochs: int = typer.Option(250, help="Number of training epochs."),
     imagesz: int = typer.Option(640, help="Input image size."),
     device: Device = typer.Option(Device.auto, help="Device to train on."),
+    batch_size: Optional[int] = typer.Option(None, "--batch-size", help="Training batch size. Defaults to -1 (ultralytics AutoBatch: probes VRAM on the target device to find the largest safe batch)."),
     save_period: int = typer.Option(50, help="Save a checkpoint every N epochs."),
     # --- Output control ---
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Base directory for training output. Defaults to <project>/model/ or <data-dir>/model/."),
@@ -136,8 +137,6 @@ def train(
     seed: int = typer.Option(88, "--seed", help="Random seed for the split (ignored with --no-split or --data-dir)."),
     # --- Verbosity ---
     debug: bool = typer.Option(False, "--debug", help="Show full ultralytics output, architecture table, and all warnings. By default training output is condensed."),
-    # --- Batch size ---
-    batch_size: Optional[int] = typer.Option(None, "--batch-size", help="Training batch size. Defaults to -1 (ultralytics AutoBatch: probes VRAM on the target device to find the largest safe batch)."),
 ):
     """Train a YOLO model on an OCTRON project or external YOLO-format data.
 
