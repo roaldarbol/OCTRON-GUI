@@ -6,9 +6,65 @@ running model training.  The `octron train` command calls this internally;
 users can also run it standalone via `octron split`.
 """
 
+import time
 from pathlib import Path
 
 _MODELS_YAML = Path(__file__).parent.parent / "yolo_octron" / "yolo_models.yaml"
+_PRINT_INTERVAL = 0.1  # seconds between progress line rewrites
+
+
+def _run_progress(heading, gen, fmt):
+    """
+    Consume a progress-yielding generator and display a single updating line,
+    matching the style used in ``octron predict``.
+
+    Parameters
+    ----------
+    heading : str
+        Text printed on its own line before the progress starts.
+    gen : iterable
+        For ``fmt='polygons'``: yields ``(no_entry, total, label, frame_no, total_frames)``.
+        For ``fmt='export'``:   yields ``(no_entry, total, label, split, frame_no, total_frames)``.
+    fmt : str
+        ``'polygons'`` or ``'export'``.
+    """
+    print(heading + "...")
+    _last_t = 0.0
+    _line_open = False
+    _last_label = None
+
+    for item in gen:
+        if fmt == "polygons":
+            no_entry, total, label, frame_no, total_frames = item
+            split_tag = ""
+        else:
+            no_entry, total, label, split, frame_no, total_frames = item
+            split_tag = f" ({split})"
+
+        # Print a fresh line whenever the label changes so completed labels
+        # stay visible in the scroll buffer.
+        if label != _last_label:
+            if _line_open:
+                print()
+            _last_label = label
+            _line_open = False
+
+        now = time.monotonic()
+        if now - _last_t < _PRINT_INTERVAL and frame_no != total_frames:
+            continue
+
+        pct = 100.0 * frame_no / total_frames if total_frames > 0 else 0.0
+        print(
+            f"\r\033[K  [{no_entry}/{total}] {label}{split_tag}: "
+            f"{frame_no}/{total_frames} frames  {pct:.0f}%",
+            end="",
+            flush=True,
+        )
+        _line_open = True
+        _last_t = now
+
+    if _line_open:
+        print()
 
 
 def run_split(
@@ -61,22 +117,9 @@ def run_split(
     yolo.prepare_labels()
 
     # --- Step 2: generate polygons / bboxes ---
-    if train_mode == "segment":
-        print("Generating polygons...")
-        for no_entry, total, label, frame_no, total_frames in yolo.prepare_polygons():
-            print(
-                f"  [{no_entry}/{total}] {label}: frame {frame_no}/{total_frames}",
-                end="\r",
-            )
-        print()
-    else:
-        print("Generating bounding boxes...")
-        for no_entry, total, label, frame_no, total_frames in yolo.prepare_bboxes():
-            print(
-                f"  [{no_entry}/{total}] {label}: frame {frame_no}/{total_frames}",
-                end="\r",
-            )
-        print()
+    verb = "Generating polygons" if train_mode == "segment" else "Generating bounding boxes"
+    gen2 = yolo.prepare_polygons() if train_mode == "segment" else yolo.prepare_bboxes()
+    _run_progress(verb, gen2, fmt="polygons")
 
     # --- Step 3: split ---
     print("Splitting data into train/val/test sets...")
@@ -93,17 +136,8 @@ def run_split(
         return
 
     # --- Step 4: export to disk ---
-    print("Exporting training data...")
-    if train_mode == "segment":
-        gen = yolo.create_training_data_segment()
-    else:
-        gen = yolo.create_training_data_detect()
-    for no_entry, total, label, split, frame_no, total_frames in gen:
-        print(
-            f"  [{no_entry}/{total}] {label} ({split}): frame {frame_no}/{total_frames}",
-            end="\r",
-        )
-    print()
+    gen4 = yolo.create_training_data_segment() if train_mode == "segment" else yolo.create_training_data_detect()
+    _run_progress("Exporting training data", gen4, fmt="export")
 
     yolo.write_yolo_config(train_mode=train_mode)
     print("Training data export complete.")

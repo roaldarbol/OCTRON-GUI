@@ -19,7 +19,6 @@ from datetime import datetime
 from PIL import Image
 import yaml
 import json 
-from tqdm import tqdm
 import numpy as np
 from natsort import natsorted
 import zarr 
@@ -367,12 +366,7 @@ class YOLO_octron:
                         
                 ##################################################################################
                 polys = {} # Collected polygons over frame indices
-                for f_no, f in tqdm(enumerate(frames, start=1), 
-                            desc=f'Polygons for label {label}', 
-                            total=len(frames),
-                            unit='frames',
-                            leave=True
-                            ):    
+                for f_no, f in enumerate(frames, start=1):
                     mask_polys = [] # List of polygons for the current frame
                     for mask_array in mask_arrays:
                         mask_raw = mask_array[f]
@@ -556,11 +550,7 @@ class YOLO_octron:
 
                 ##################################################################################
                 bboxes_dict = {}  # frame_id -> list of bbox tuples
-                for f_no, f in tqdm(enumerate(frames, start=1),
-                                    desc=f'Bboxes for label {label}',
-                                    total=len(frames),
-                                    unit='frames',
-                                    leave=True):
+                for f_no, f in enumerate(frames, start=1):
                     frame_bboxes = []
                     for mask_array in mask_arrays:
                         mask_raw = mask_array[f]
@@ -768,29 +758,17 @@ class YOLO_octron:
             path_prefix = Path(path).name   
             video_data = labels.pop('video')
             _ = labels.pop('video_file_path')
-            for entry in tqdm(labels,
-                            total=len(labels),
-                            position=0,
-                            unit='labels',
-                            leave=True,
-                            desc=f'Exporting {len(labels)} label(s)'
-                            ):
+            for entry in labels:
                 current_label_id = entry
-                label = labels[entry]['label']  
-                # Extract the size of the masks for normalization later on 
+                label = labels[entry]['label']
+                # Extract the size of the masks for normalization later on
                 for m in labels[entry]['masks']:
                     assert m.shape == labels[entry]['masks'][0].shape, f'All masks should have the same shape'
                 _, mask_height, mask_width = labels[entry]['masks'][0].shape
-                
+
                 for split in ['train', 'val', 'test']:
                     current_indices = labels[entry]['frames_split'][split]
-                    for frame_no, frame_id in tqdm(enumerate(current_indices),
-                                                    total=len(current_indices), 
-                                                    desc=f'Exporting {split} frames', 
-                                                    position=1,    
-                                                    unit='frames',
-                                                    leave=False,
-                                                    ):
+                    for frame_no, frame_id in enumerate(current_indices):
                         frame = video_data[frame_id]
                         image_output_path = self.data_path / split / f'{path_prefix}_{frame_id}.png'
                         if not image_output_path.exists():
@@ -908,23 +886,13 @@ class YOLO_octron:
             path_prefix = Path(path).name
             video_data = labels.pop('video')
             _ = labels.pop('video_file_path')
-            for entry in tqdm(labels,
-                              total=len(labels),
-                              position=0,
-                              unit='labels',
-                              leave=True,
-                              desc=f'Exporting {len(labels)} label(s)'):
+            for entry in labels:
                 current_label_id = entry
                 label = labels[entry]['label']
 
                 for split in ['train', 'val', 'test']:
                     current_indices = labels[entry]['frames_split'][split]
-                    for frame_no, frame_id in tqdm(enumerate(current_indices),
-                                                    total=len(current_indices),
-                                                    desc=f'Exporting {split} frames',
-                                                    position=1,
-                                                    unit='frames',
-                                                    leave=False):
+                    for frame_no, frame_id in enumerate(current_indices):
                         frame = video_data[frame_id]
                         image_output_path = self.data_path / split / f'{path_prefix}_{frame_id}.png'
                         if not image_output_path.exists():
