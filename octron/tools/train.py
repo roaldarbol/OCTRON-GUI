@@ -186,15 +186,15 @@ def run_training(
             train_mode = yaml_mode
         config_path = data_dir / "yolo_config.yaml"
         img_search_path = data_dir
-        output_base = Path(output_dir) if output_dir else data_dir / "model"
+        output_base = (Path(output_dir) if output_dir else data_dir / "model").resolve()
         skip_split = True  # external data is already prepared
     else:
         if project_path is None:
             raise ValueError("Either project_path or data_dir must be provided.")
-        project_path = Path(project_path)
+        project_path = Path(project_path).resolve()
         config_path = project_path / "model" / "training_data" / "yolo_config.yaml"
         img_search_path = project_path / "model" / "training_data"
-        output_base = Path(output_dir) if output_dir else project_path / "model"
+        output_base = (Path(output_dir) if output_dir else project_path / "model").resolve()
 
     # Default train_mode if still unresolved
     if train_mode is None:
