@@ -281,9 +281,14 @@ def run_training(
         )
 
     # --- Step 5: load the base model (or last.pt when resuming) ---
+    # When only --data-dir is provided, output_base (data_dir/model/) is used
+    # as the YOLO_octron project root. Create it if needed so the path-existence
+    # check in YOLO_octron's project_path setter doesn't raise.
+    yolo_project_path = project_path if project_path is not None else output_base
+    yolo_project_path.mkdir(parents=True, exist_ok=True)
     yolo = YOLO_octron(
         models_yaml_path=_MODELS_YAML,
-        project_path=project_path if project_path is not None else output_base,
+        project_path=yolo_project_path,
         clean_training_dir=False,
     )
     yolo.train_mode = train_mode
