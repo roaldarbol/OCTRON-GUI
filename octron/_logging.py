@@ -33,8 +33,9 @@ class _InterceptHandler(logging.Handler):
         logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
 
 
-# Substrings found in known-noisy third-party WARNING messages that should be
-# hidden in normal (non-debug) operation.
+# Substrings found in known-noisy third-party WARNING messages.
+# These are suppressed in BOTH normal and debug mode: they are per-frame or
+# import-time side effects from third-party bugs and are never actionable.
 _SUPPRESSED_WARNING_SUBSTRINGS = (
     "json_encoders",              # pydantic v2 deprecation at napari import time
     "argument 'device'",          # torch pin_memory() / is_pinned() — PyTorch 2.10 bug
@@ -42,6 +43,14 @@ _SUPPRESSED_WARNING_SUBSTRINGS = (
     "trace to be incorrect",      # TracerWarning fired during AMP initialisation
     "already a ScriptModule",     # torch.jit UserWarning during AMP initialisation
     "'rect=True' is incompatible",  # ultralytics dataloader shuffle warning (expected)
+)
+
+# Python logger name prefixes whose DEBUG/INFO records are always suppressed,
+# even in --debug mode.  These libraries produce high-volume messages that are
+# unrelated to octron behaviour and break in-place progress-bar display.
+_NOISY_LIBRARY_PREFIXES = (
+    "matplotlib",
+    "PIL",
 )
 
 # Suppress the pydantic json_encoders DeprecationWarning at import time so it
@@ -54,33 +63,43 @@ warnings.filterwarnings("ignore", message=r".*json_encoders.*")
 def _make_loguru_filter(debug: bool):
     """Return a loguru filter callable for the given verbosity mode.
 
-    In non-debug mode the filter:
-    - Passes any record from an ``octron.*`` module at INFO and above.
-    - Passes non-octron WARNING records unless they match a known-noisy pattern
-      (pydantic, torch pin_memory, torch.jit TracerWarning, …).
-    - Blocks everything else — in particular ultralytics INFO output such as
-      the model architecture table, training-config dump, TensorBoard URL, and
-      dataset scan progress bars.
+    Both modes suppress:
+    - Known per-frame / import-time WARNING noise (pin_memory, TracerWarning,
+      pydantic json_encoders, …) — these fire thousands of times and are not
+      actionable; hiding them even in debug keeps progress bars readable.
+    - DEBUG/INFO from high-volume library loggers (matplotlib, PIL) — unrelated
+      to octron and would break ``\\r\\033[K`` in-place progress-bar display.
 
-    In debug mode ``None`` is returned (loguru skips filtering entirely).
+    Non-debug mode additionally:
+    - Only passes octron.* records at INFO and above.
+    - Blocks all other INFO/DEBUG — suppresses the ultralytics architecture
+      table, training-config dump, TensorBoard URL, scan progress bars, etc.
     """
-    if debug:
-        return None
-
     substrings = _SUPPRESSED_WARNING_SUBSTRINGS
+    noisy_prefixes = _NOISY_LIBRARY_PREFIXES
 
     def _filter(record) -> bool:
         level_no = record["level"].no
-        # Always pass octron messages at INFO and above
-        if record["name"].startswith("octron") or record["name"] == "__main__":
+        name = record["name"]
+
+        # Always suppress per-frame WARNING noise (both normal and debug mode).
+        if level_no == 30:  # WARNING
+            if any(s in record["message"] for s in substrings):
+                return False
+
+        # Always suppress high-volume library debug spam that breaks progress bars.
+        if level_no < 30 and any(name.startswith(p) for p in noisy_prefixes):
+            return False
+
+        if debug:
+            # Show everything else in debug mode.
+            return True
+
+        # Non-debug: pass octron messages at INFO and above.
+        if name.startswith("octron") or name == "__main__":
             return level_no >= 20  # INFO = 20
-        # Non-octron WARNING: pass unless it matches a suppressed pattern
-        if level_no >= 30:  # WARNING = 30
-            msg = record["message"]
-            return not any(s in msg for s in substrings)
-        # Non-octron INFO and below: suppress
-        # (covers ultralytics architecture table, config dump, TensorBoard URL, …)
-        return False
+        # Non-octron WARNING+ that wasn't suppressed above.
+        return level_no >= 30
 
     return _filter
 
