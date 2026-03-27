@@ -1284,6 +1284,12 @@ class YOLO_octron:
             # https://docs.ultralytics.com/modes/train/#resuming-interrupted-trainings
             # overlap_mask - https://github.com/ultralytics/ultralytics/issues/3213#issuecomment-2799841153
             nonlocal training_error
+            # Re-apply our logging configuration.  ultralytics installs its own
+            # loguru handler when first imported; calling setup_logging() here
+            # (after import, inside the training thread) evicts it so all output
+            # flows through our single, consistently-filtered handler.
+            from octron._logging import setup_logging as _setup_logging
+            _setup_logging(debug=debug)
             try:
                 img_height, img_width, rect = _find_train_image_size(self.data_path)
                 # Start training
