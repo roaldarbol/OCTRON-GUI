@@ -4,10 +4,15 @@ OCTRON training pipeline.
 Wraps the YOLO_octron model-loading and training steps into a single callable.
 By default, training data is prepared automatically via ``run_split()``.
 Pass ``skip_split=True`` if ``octron split`` has already been run.
+
+External training data (not from an OCTRON project) can be used by passing
+``data_dir`` pointing to a directory that contains a valid ``yolo_config.yaml``
+together with the standard YOLO train/val/test split subdirectories.
 """
 
 import json
 from pathlib import Path
+from typing import Optional
 
 _MODELS_YAML = Path(__file__).parent.parent / "yolo_octron" / "yolo_models.yaml"
 
@@ -64,10 +69,70 @@ def _normalise_model_name(model, models_yaml_path):
     return match if match is not None else model_str
 
 
+def _validate_data_dir(data_dir: Path):
+    """
+    Validate that *data_dir* contains a complete YOLO training dataset.
+
+    Checks performed:
+    - ``yolo_config.yaml`` exists and is parseable
+    - Required fields ``names``, ``train``, and ``val`` are present
+    - Train and val subdirectories exist
+    - At least one label file (.txt) is present in the train split
+
+    Returns
+    -------
+    cfg : dict
+        Parsed contents of ``yolo_config.yaml``.
+    train_mode : str or None
+        Value of ``train_mode`` from the yaml, or ``None`` if not present.
+    """
+    import yaml
+
+    config_path = data_dir / "yolo_config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"No yolo_config.yaml found in {data_dir}. "
+            "The data directory must contain a valid YOLO config file."
+        )
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    for field in ("names", "train", "val"):
+        if field not in cfg:
+            raise ValueError(
+                f"yolo_config.yaml is missing required field '{field}'."
+            )
+
+    train_subdir = data_dir / cfg["train"]
+    val_subdir = data_dir / cfg["val"]
+
+    if not train_subdir.exists():
+        raise FileNotFoundError(
+            f"Training split directory not found: {train_subdir}"
+        )
+    if not val_subdir.exists():
+        raise FileNotFoundError(
+            f"Validation split directory not found: {val_subdir}"
+        )
+
+    label_files = list(train_subdir.glob("*.txt"))
+    if not label_files:
+        raise FileNotFoundError(
+            f"No label files (.txt) found in training split: {train_subdir}"
+        )
+
+    yaml_mode = cfg.get("train_mode")
+    return cfg, yaml_mode
+
+
 def run_training(
-    project_path,
+    project_path=None,
+    data_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    run_name: Optional[str] = None,
     model="YOLO26m",
-    train_mode="segment",
+    train_mode=None,
     device="auto",
     epochs=250,
     imagesz=640,
@@ -85,12 +150,30 @@ def run_training(
     By default this prepares and exports training data before training.
     Pass ``skip_split=True`` to skip that step when data is already up to date.
 
+    External training data (not from an OCTRON project) can be used by passing
+    ``data_dir`` pointing to a directory with a ``yolo_config.yaml`` file and
+    the corresponding YOLO split subdirectories.
+
     Parameters
     ----------
-    project_path : str or Path
-        Path to the OCTRON project directory.
+    project_path : str or Path, optional
+        Path to the OCTRON project directory. Required unless ``data_dir`` is given.
+    data_dir : Path, optional
+        Path to an external YOLO training data directory. When provided,
+        ``skip_split`` is implied and ``train_mode`` is read from
+        ``yolo_config.yaml`` if not explicitly supplied.
+    output_dir : Path, optional
+        Base directory where the training run folder will be created.
+        Defaults to ``<project_path>/model/`` or ``<data_dir>/model/``.
+    run_name : str, optional
+        Name of the training run subdirectory. When ``None`` the GUI default
+        ``'training'`` is used, preserving existing behaviour. CLI callers
+        should pass an informative name such as ``'yolo26m_seg_640_20260327'``.
     model : str or Path
         YOLO model name (e.g. 'YOLO11m') or path to an existing model file.
+    train_mode : str or None
+        'segment' or 'detect'. When ``None`` and ``data_dir`` is provided the
+        value is read from ``yolo_config.yaml``; falls back to 'segment'.
     device : str
         Device to train on ('auto', 'cpu', 'cuda', 'mps'). 'auto' selects
         CUDA if available, then MPS, then CPU.
@@ -100,8 +183,6 @@ def run_training(
         Input image size for training.
     save_period : int
         Save a checkpoint every N epochs.
-    train_mode : str
-        'segment' for instance segmentation, 'detect' for bounding-box detection.
     resume : bool
         Resume training from an existing last.pt checkpoint.
     skip_split : bool
@@ -118,13 +199,43 @@ def run_training(
     from octron.test_gpu import auto_device
     from octron.tools.split import run_split
 
-    # Unwrap enums to plain strings so they are never serialised as Python
-    # object tags when written into YAML config files downstream.
-    train_mode = train_mode.value if hasattr(train_mode, 'value') else str(train_mode)
+    # Unwrap enums to plain strings
     device = device.value if hasattr(device, 'value') else str(device)
+    if train_mode is not None:
+        train_mode = train_mode.value if hasattr(train_mode, 'value') else str(train_mode)
 
-    best_pt = Path(project_path) / "model" / "training" / "weights" / "best.pt"
-    last_pt = Path(project_path) / "model" / "training" / "weights" / "last.pt"
+    # --- Resolve paths and config based on data source ---
+    if data_dir is not None:
+        data_dir = Path(data_dir)
+        cfg, yaml_mode = _validate_data_dir(data_dir)
+        # Use yaml train_mode if caller didn't specify one explicitly
+        if train_mode is None:
+            train_mode = yaml_mode
+        config_path = data_dir / "yolo_config.yaml"
+        img_search_path = data_dir
+        output_base = Path(output_dir) if output_dir else data_dir / "model"
+        batch_cache = output_base / "autobatch_cache.json"
+        skip_split = True  # external data is already prepared
+    else:
+        if project_path is None:
+            raise ValueError("Either project_path or data_dir must be provided.")
+        project_path = Path(project_path)
+        config_path = project_path / "model" / "training_data" / "yolo_config.yaml"
+        img_search_path = project_path / "model" / "training_data"
+        output_base = Path(output_dir) if output_dir else project_path / "model"
+        batch_cache = project_path / "model" / "autobatch_cache.json"
+
+    # Default train_mode if still unresolved
+    if train_mode is None:
+        train_mode = "segment"
+
+    # Default run_name: GUI always passes 'training'; CLI passes an informative name
+    if run_name is None:
+        run_name = "training"
+
+    # --- Check for existing run ---
+    best_pt = output_base / run_name / "weights" / "best.pt"
+    last_pt = output_base / run_name / "weights" / "last.pt"
     if resume:
         if best_pt.exists():
             print(f"Training already completed ({best_pt}). Nothing to resume. Use --overwrite to retrain from scratch.")
@@ -139,7 +250,7 @@ def run_training(
     if device == "auto":
         device = auto_device()
 
-    # --- Steps 1–4: prepare and export training data ---
+    # --- Steps 1–4: prepare and export training data (OCTRON projects only) ---
     if not skip_split:
         run_split(
             project_path=project_path,
@@ -153,11 +264,13 @@ def run_training(
     # --- Step 5: load the base model (or last.pt when resuming) ---
     yolo = YOLO_octron(
         models_yaml_path=_MODELS_YAML,
-        project_path=project_path,
+        project_path=project_path if project_path is not None else output_base,
         clean_training_dir=False,
     )
     yolo.train_mode = train_mode
-    yolo.config_path = yolo.data_path / "yolo_config.yaml"
+    yolo.config_path = config_path
+    yolo.data_path = img_search_path
+    yolo.training_path = output_base
 
     if resume:
         print(f"Resuming from checkpoint: {last_pt}")
@@ -168,10 +281,11 @@ def run_training(
         yolo.load_model(model, train_mode=train_mode)
 
     # --- Step 6: train ---
-    batch_cache = Path(project_path) / "model" / "autobatch_cache.json"
     batch = _get_batch_size(yolo, imagesz, device, batch_cache)
 
     print(f"Training for {epochs} epochs on {device}...")
+    print(f"Run name: {run_name}")
+    print(f"Output:   {output_base / run_name}")
     for progress in yolo.train(
         device=device,
         imagesz=imagesz,
@@ -180,6 +294,7 @@ def run_training(
         train_mode=train_mode,
         resume=resume,
         batch=batch,
+        run_name=run_name,
     ):
         epoch = progress.get("epoch", "?")
         total_epochs = progress.get("total_epochs", "?")

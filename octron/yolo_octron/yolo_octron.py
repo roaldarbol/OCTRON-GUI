@@ -1120,6 +1120,7 @@ class YOLO_octron:
               train_mode='segment',
               resume=False,
               batch=-1,
+              run_name='training',
               ):
         """
         Train the YOLO model with epoch progress updates
@@ -1139,7 +1140,11 @@ class YOLO_octron:
         resume : bool
             If True, resume training from the loaded checkpoint (last.pt).
             Most training parameters are restored from the checkpoint.
-            
+        run_name : str
+            Name of the training run subdirectory inside ``training_path``.
+            Defaults to ``'training'`` (preserves GUI behaviour). CLI runs
+            pass an informative name such as ``'yolo26m_seg_640_20260327'``.
+
         Yields
         ------
         dict
@@ -1235,19 +1240,28 @@ class YOLO_octron:
             """
             data_path = Path(data_path)
             assert data_path.exists(), f"Data path {data_path} does not exist."
-            png_files = list(data_path.glob('**/*.png'))
-            if len(png_files) == 0:
-                raise FileNotFoundError(f"No .png files found in {data_path.as_posix()}")
-            logger.debug(f'Found {len(png_files)} png files')
-            samples = random.sample(png_files, min(max_samples, len(png_files)))
+            image_files = (
+                list(data_path.glob('**/*.png'))
+                + list(data_path.glob('**/*.jpg'))
+                + list(data_path.glob('**/*.jpeg'))
+            )
+            if len(image_files) == 0:
+                raise FileNotFoundError(f"No image files (.png/.jpg) found in {data_path.as_posix()}")
+            logger.debug(f'Found {len(image_files)} image files')
+            samples = random.sample(image_files, min(max_samples, len(image_files)))
 
             widths, heights = [], []
             for fpath in samples:
-                # Read width/height directly from PNG IHDR chunk (bytes 16-23)
-                # I had it on PIL.Image.open() per file first, but this is very slow ... 
-                with open(fpath, 'rb') as f:
-                    f.seek(16)
-                    w, h = struct.unpack('>II', f.read(8))
+                if fpath.suffix.lower() == '.png':
+                    # Read width/height directly from PNG IHDR chunk (bytes 16-23)
+                    # I had it on PIL.Image.open() per file first, but this is very slow ...
+                    with open(fpath, 'rb') as f:
+                        f.seek(16)
+                        w, h = struct.unpack('>II', f.read(8))
+                else:
+                    from PIL import Image
+                    with Image.open(fpath) as img:
+                        w, h = img.size
                 widths.append(w)
                 heights.append(h)
             
@@ -1298,7 +1312,7 @@ class YOLO_octron:
                 copy_paste_prob = 0.0 if rect else 0.25
                 train_kwargs = dict(
                     data=self.config_path.as_posix() if self.config_path is not None else '',
-                    name='training',
+                    name=run_name,
                     project=self.training_path.as_posix() if self.training_path is not None else '',
                     mode=train_mode,
                     device=device,
