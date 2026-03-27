@@ -8,6 +8,7 @@ The CLI branch can pass `debug=True` to enable DEBUG-level output.
 
 import sys
 import logging
+import warnings
 from loguru import logger
 
 from octron._version import version as octron_version
@@ -35,12 +36,19 @@ class _InterceptHandler(logging.Handler):
 # Substrings found in known-noisy third-party WARNING messages that should be
 # hidden in normal (non-debug) operation.
 _SUPPRESSED_WARNING_SUBSTRINGS = (
-    "json_encoders",        # pydantic v2 deprecation at napari import time
-    "argument 'device'",    # torch pin_memory() / is_pinned() — PyTorch 2.10 bug
-    "torch.jit.trace",      # torch.jit.trace / trace_method DeprecationWarning
-    "trace to be incorrect",  # TracerWarning fired during AMP initialisation
-    "already a ScriptModule",  # torch.jit UserWarning during AMP initialisation
+    "json_encoders",              # pydantic v2 deprecation at napari import time
+    "argument 'device'",          # torch pin_memory() / is_pinned() — PyTorch 2.10 bug
+    "torch.jit.trace",            # torch.jit.trace / trace_method DeprecationWarning
+    "trace to be incorrect",      # TracerWarning fired during AMP initialisation
+    "already a ScriptModule",     # torch.jit UserWarning during AMP initialisation
+    "'rect=True' is incompatible",  # ultralytics dataloader shuffle warning (expected)
 )
+
+# Suppress the pydantic json_encoders DeprecationWarning at import time so it
+# is filtered before any loguru handler (including any installed by ultralytics)
+# can print it.  This fires when napari (imported by yolo_octron.py) loads
+# pydantic — before we have a chance to evict ultralytics' loguru handler.
+warnings.filterwarnings("ignore", message=r".*json_encoders.*")
 
 
 def _make_loguru_filter(debug: bool):
@@ -132,6 +140,27 @@ def setup_logging(debug: bool = False) -> None:
     # Non-debug: only forward WARNING+ from stdlib logging to avoid paying the
     # cost of filtering high-volume ultralytics INFO records in _InterceptHandler.
     logging.root.setLevel(logging.DEBUG if debug else logging.WARNING)
+
+    # Tame the ultralytics Python logger.  ultralytics installs a StreamHandler
+    # directly on logging.getLogger('ultralytics') that prints architecture
+    # tables, config dumps, TensorBoard URLs, etc. straight to stdout — bypassing
+    # loguru entirely.  We remove those handlers and set the level so that:
+    #   • non-debug: only WARNING+ propagates (via root) to our InterceptHandler
+    #   • debug: everything propagates
+    # tqdm epoch-progress bars are written directly to stderr by tqdm and are
+    # unaffected by this change.
+    try:
+        _ult_logger = logging.getLogger("ultralytics")
+        for _h in _ult_logger.handlers[:]:
+            _ult_logger.removeHandler(_h)
+        _ult_logger.setLevel(logging.DEBUG if debug else logging.WARNING)
+        _ult_logger.propagate = True
+    except Exception:
+        pass  # ultralytics not yet imported — nothing to tame
+
+    # Re-apply the pydantic filter in case it was cleared by a third party.
+    if not debug:
+        warnings.filterwarnings("ignore", message=r".*json_encoders.*")
 
     if debug:
         logger.debug("Debug logging enabled")

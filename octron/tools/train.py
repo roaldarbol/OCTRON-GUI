@@ -12,18 +12,9 @@ together with the standard YOLO train/val/test split subdirectories.
 
 from pathlib import Path
 from typing import Optional
+from loguru import logger
 
 _MODELS_YAML = Path(__file__).parent.parent / "yolo_octron" / "yolo_models.yaml"
-
-
-def _get_batch_size(model, imgsz):
-    """Return the optimal batch size for training via ultralytics AutoBatch."""
-    from ultralytics.utils.autobatch import check_train_batch_size
-
-    print("AutoBatch: searching for optimal batch size...")
-    batch = check_train_batch_size(model.model.model, imgsz=imgsz, amp=True)
-    print(f"AutoBatch: using batch size {batch}")
-    return batch
 
 
 def _normalise_model_name(model, models_yaml_path):
@@ -117,6 +108,8 @@ def run_training(
     seed=88,
     # --- Verbosity ---
     debug=False,
+    # --- Batch size ---
+    batch_size=-1,
 ):
     """
     Run the OCTRON/YOLO training pipeline.
@@ -171,9 +164,13 @@ def run_training(
     seed : int
         Random seed for the split (ignored when ``skip_split=True``).
     """
-    from octron.yolo_octron.yolo_octron import YOLO_octron
+    from octron.yolo_octron.yolo_octron import YOLO_octron  # triggers heavy imports incl. ultralytics
+    from octron._logging import setup_logging
     from octron.test_gpu import auto_device
     from octron.tools.split import run_split
+    # Evict any loguru handler ultralytics installed during its import so all
+    # subsequent output flows through our single, consistently-filtered handler.
+    setup_logging(debug=debug)
 
     # Unwrap enums to plain strings
     device = device.value if hasattr(device, 'value') else str(device)
@@ -212,13 +209,13 @@ def run_training(
     last_pt = output_base / run_name / "weights" / "last.pt"
     if resume:
         if best_pt.exists():
-            print(f"Training already completed ({best_pt}). Nothing to resume. Use --overwrite to retrain from scratch.")
+            logger.info(f"Training already completed ({best_pt}). Nothing to resume. Use --overwrite to retrain from scratch.")
             return
         if not last_pt.exists():
-            print("No interrupted training found (last.pt missing). Starting fresh.")
+            logger.info("No interrupted training found (last.pt missing). Starting fresh.")
             resume = False
     elif best_pt.exists() and not overwrite:
-        print(f"Trained model already exists at {best_pt}. Use --overwrite to retrain.")
+        logger.info(f"Trained model already exists at {best_pt}. Use --overwrite to retrain.")
         return
 
     if device == "auto":
@@ -231,7 +228,7 @@ def run_training(
     # large projects.  If the yolo_config.yaml is already present the data is
     # ready to use; pass --overwrite to force regeneration.
     if not skip_split and config_path.exists() and not overwrite:
-        print(
+        logger.info(
             f"Training data already exists at {config_path.parent} — skipping data "
             "preparation. Delete the training_data folder or use --overwrite to regenerate."
         )
@@ -264,19 +261,20 @@ def run_training(
     yolo.training_path = output_base
 
     if resume:
-        print(f"Resuming from checkpoint: {last_pt}")
+        logger.info(f"Resuming from checkpoint: {last_pt}")
         yolo.load_model(last_pt, train_mode=train_mode)
     else:
         model = _normalise_model_name(model, _MODELS_YAML)
-        print(f"Loading model: {model}...")
+        logger.info(f"Loading model: {model}...")
         yolo.load_model(model, train_mode=train_mode)
 
     # --- Step 6: train ---
-    batch = _get_batch_size(yolo, imagesz)
-
-    print(f"Training for {epochs} epochs on {device}...")
-    print(f"Run name: {run_name}")
-    print(f"Output:   {output_base / run_name}")
+    # batch_size=-1 tells ultralytics to run AutoBatch internally, after the
+    # model has been placed on the target device — this gives accurate VRAM
+    # readings.  Callers can pass a positive integer to fix the batch size.
+    logger.info(f"Training for {epochs} epochs on {device}...")
+    logger.info(f"Run name: {run_name}")
+    logger.info(f"Output:   {output_base / run_name}")
     for progress in yolo.train(
         device=device,
         imagesz=imagesz,
@@ -284,7 +282,7 @@ def run_training(
         save_period=save_period,
         train_mode=train_mode,
         resume=resume,
-        batch=batch,
+        batch=batch_size,
         run_name=run_name,
         debug=debug,
     ):
@@ -293,4 +291,4 @@ def run_training(
         remaining = progress.get("remaining_time", 0)
         print(f"  Epoch {epoch}/{total_epochs} | ETA: {remaining:.0f}s", end="\r")
     print()
-    print("Training complete.")
+    logger.info("Training complete.")

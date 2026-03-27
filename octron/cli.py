@@ -136,6 +136,8 @@ def train(
     seed: int = typer.Option(88, "--seed", help="Random seed for the split (ignored with --no-split or --data-dir)."),
     # --- Verbosity ---
     debug: bool = typer.Option(False, "--debug", help="Show full ultralytics output, architecture table, and all warnings. By default training output is condensed."),
+    # --- Batch size ---
+    batch_size: Optional[int] = typer.Option(None, "--batch-size", help="Training batch size. Defaults to -1 (ultralytics AutoBatch: probes VRAM on the target device to find the largest safe batch)."),
 ):
     """Train a YOLO model on an OCTRON project or external YOLO-format data.
 
@@ -190,6 +192,7 @@ def train(
         val_fraction=val_fraction,
         seed=seed,
         debug=debug,
+        batch_size=batch_size if batch_size is not None else -1,
     )
 
 
