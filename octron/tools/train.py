@@ -10,52 +10,19 @@ External training data (not from an OCTRON project) can be used by passing
 together with the standard YOLO train/val/test split subdirectories.
 """
 
-import json
 from pathlib import Path
 from typing import Optional
 
 _MODELS_YAML = Path(__file__).parent.parent / "yolo_octron" / "yolo_models.yaml"
 
 
-def _get_batch_size(model, imgsz, device, cache_path):
-    """
-    Return the optimal batch size for training, using a cache to avoid
-    running AutoBatch on every training run.
-
-    The cache is stored at ``cache_path`` and keyed by model architecture,
-    image size, and GPU name so it stays valid across runs with the same
-    hardware and model.
-    """
-    import torch
-
-    gpu_name = (
-        torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"
-    )
-    cache_key = f"{model.model.model.__class__.__name__}_{imgsz}_{gpu_name}"
-
-    cache_path = Path(cache_path)
-    cache = {}
-    if cache_path.exists():
-        try:
-            with open(cache_path) as f:
-                cache = json.load(f)
-        except Exception:
-            cache = {}
-
-    if cache_key in cache:
-        batch = cache[cache_key]
-        print(f"AutoBatch: using cached batch size {batch} for {gpu_name} (imgsz={imgsz})")
-        return batch
-
-    print("AutoBatch: running batch size search (result will be cached) ...")
+def _get_batch_size(model, imgsz):
+    """Return the optimal batch size for training via ultralytics AutoBatch."""
     from ultralytics.utils.autobatch import check_train_batch_size
-    batch = check_train_batch_size(model.model.model, imgsz=imgsz, amp=True)
 
-    cache[cache_key] = batch
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "w") as f:
-        json.dump(cache, f)
-    print(f"AutoBatch: batch size {batch} cached to {cache_path}")
+    print("AutoBatch: searching for optimal batch size...")
+    batch = check_train_batch_size(model.model.model, imgsz=imgsz, amp=True)
+    print(f"AutoBatch: using batch size {batch}")
     return batch
 
 
@@ -223,7 +190,6 @@ def run_training(
         config_path = data_dir / "yolo_config.yaml"
         img_search_path = data_dir
         output_base = Path(output_dir) if output_dir else data_dir / "model"
-        batch_cache = output_base / "autobatch_cache.json"
         skip_split = True  # external data is already prepared
     else:
         if project_path is None:
@@ -232,7 +198,6 @@ def run_training(
         config_path = project_path / "model" / "training_data" / "yolo_config.yaml"
         img_search_path = project_path / "model" / "training_data"
         output_base = Path(output_dir) if output_dir else project_path / "model"
-        batch_cache = project_path / "model" / "autobatch_cache.json"
 
     # Default train_mode if still unresolved
     if train_mode is None:
@@ -307,7 +272,7 @@ def run_training(
         yolo.load_model(model, train_mode=train_mode)
 
     # --- Step 6: train ---
-    batch = _get_batch_size(yolo, imagesz, device, batch_cache)
+    batch = _get_batch_size(yolo, imagesz)
 
     print(f"Training for {epochs} epochs on {device}...")
     print(f"Run name: {run_name}")
