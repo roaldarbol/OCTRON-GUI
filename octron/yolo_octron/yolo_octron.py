@@ -1089,6 +1089,7 @@ class YOLO_octron:
               resume=False,
               batch=-1,
               run_name='training',
+              debug=False,
               ):
         """
         Train the YOLO model with epoch progress updates
@@ -1317,6 +1318,7 @@ class YOLO_octron:
                     save=True,
                     save_period=save_period,
                     exist_ok=True,
+                    verbose=debug,  # suppress architecture table and param dump unless --debug
                     nms=False,
                     max_det=2000, # Increasing this for dense scenes - I think it might affect val too
                     # Augmentation

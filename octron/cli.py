@@ -134,6 +134,8 @@ def train(
     train_fraction: float = typer.Option(0.7, "--train", help="Fraction of frames for training (ignored with --no-split or --data-dir)."),
     val_fraction: float = typer.Option(0.15, "--val", help="Fraction of frames for validation (ignored with --no-split or --data-dir)."),
     seed: int = typer.Option(88, "--seed", help="Random seed for the split (ignored with --no-split or --data-dir)."),
+    # --- Verbosity ---
+    debug: bool = typer.Option(False, "--debug", help="Show full ultralytics output, architecture table, and all warnings. By default training output is condensed."),
 ):
     """Train a YOLO model on an OCTRON project or external YOLO-format data.
 
@@ -144,7 +146,11 @@ def train(
     train/val subdirectories with image and label files.
     """
     from octron.tools.train import run_training
+    from octron._logging import setup_logging
     from datetime import date
+
+    # Re-initialise logging so --debug takes effect before any imports fire
+    setup_logging(debug=debug)
 
     if project_path is None and data_dir is None:
         raise typer.BadParameter(
@@ -183,6 +189,7 @@ def train(
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         seed=seed,
+        debug=debug,
     )
 
 

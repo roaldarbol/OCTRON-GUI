@@ -148,6 +148,8 @@ def run_training(
     train_fraction=0.7,
     val_fraction=0.15,
     seed=88,
+    # --- Verbosity ---
+    debug=False,
 ):
     """
     Run the OCTRON/YOLO training pipeline.
@@ -319,6 +321,7 @@ def run_training(
         resume=resume,
         batch=batch,
         run_name=run_name,
+        debug=debug,
     ):
         epoch = progress.get("epoch", "?")
         total_epochs = progress.get("total_epochs", "?")
