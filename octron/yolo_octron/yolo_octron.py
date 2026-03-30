@@ -19,7 +19,6 @@ from datetime import datetime
 from PIL import Image
 import yaml
 import json 
-from tqdm import tqdm
 import numpy as np
 from natsort import natsorted
 import zarr 
@@ -367,12 +366,7 @@ class YOLO_octron:
                         
                 ##################################################################################
                 polys = {} # Collected polygons over frame indices
-                for f_no, f in tqdm(enumerate(frames, start=1), 
-                            desc=f'Polygons for label {label}', 
-                            total=len(frames),
-                            unit='frames',
-                            leave=True
-                            ):    
+                for f_no, f in enumerate(frames, start=1):
                     mask_polys = [] # List of polygons for the current frame
                     for mask_array in mask_arrays:
                         mask_raw = mask_array[f]
@@ -556,11 +550,7 @@ class YOLO_octron:
 
                 ##################################################################################
                 bboxes_dict = {}  # frame_id -> list of bbox tuples
-                for f_no, f in tqdm(enumerate(frames, start=1),
-                                    desc=f'Bboxes for label {label}',
-                                    total=len(frames),
-                                    unit='frames',
-                                    leave=True):
+                for f_no, f in enumerate(frames, start=1):
                     frame_bboxes = []
                     for mask_array in mask_arrays:
                         mask_raw = mask_array[f]
@@ -768,29 +758,17 @@ class YOLO_octron:
             path_prefix = Path(path).name   
             video_data = labels.pop('video')
             _ = labels.pop('video_file_path')
-            for entry in tqdm(labels,
-                            total=len(labels),
-                            position=0,
-                            unit='labels',
-                            leave=True,
-                            desc=f'Exporting {len(labels)} label(s)'
-                            ):
+            for entry in labels:
                 current_label_id = entry
-                label = labels[entry]['label']  
-                # Extract the size of the masks for normalization later on 
+                label = labels[entry]['label']
+                # Extract the size of the masks for normalization later on
                 for m in labels[entry]['masks']:
                     assert m.shape == labels[entry]['masks'][0].shape, f'All masks should have the same shape'
                 _, mask_height, mask_width = labels[entry]['masks'][0].shape
-                
+
                 for split in ['train', 'val', 'test']:
                     current_indices = labels[entry]['frames_split'][split]
-                    for frame_no, frame_id in tqdm(enumerate(current_indices),
-                                                    total=len(current_indices), 
-                                                    desc=f'Exporting {split} frames', 
-                                                    position=1,    
-                                                    unit='frames',
-                                                    leave=False,
-                                                    ):
+                    for frame_no, frame_id in enumerate(current_indices):
                         frame = video_data[frame_id]
                         image_output_path = self.data_path / split / f'{path_prefix}_{frame_id}.png'
                         if not image_output_path.exists():
@@ -908,23 +886,13 @@ class YOLO_octron:
             path_prefix = Path(path).name
             video_data = labels.pop('video')
             _ = labels.pop('video_file_path')
-            for entry in tqdm(labels,
-                              total=len(labels),
-                              position=0,
-                              unit='labels',
-                              leave=True,
-                              desc=f'Exporting {len(labels)} label(s)'):
+            for entry in labels:
                 current_label_id = entry
                 label = labels[entry]['label']
 
                 for split in ['train', 'val', 'test']:
                     current_indices = labels[entry]['frames_split'][split]
-                    for frame_no, frame_id in tqdm(enumerate(current_indices),
-                                                    total=len(current_indices),
-                                                    desc=f'Exporting {split} frames',
-                                                    position=1,
-                                                    unit='frames',
-                                                    leave=False):
+                    for frame_no, frame_id in enumerate(current_indices):
                         frame = video_data[frame_id]
                         image_output_path = self.data_path / split / f'{path_prefix}_{frame_id}.png'
                         if not image_output_path.exists():
@@ -1120,6 +1088,8 @@ class YOLO_octron:
               train_mode='segment',
               resume=False,
               batch=-1,
+              run_name='training',
+              debug=False,
               ):
         """
         Train the YOLO model with epoch progress updates
@@ -1139,7 +1109,11 @@ class YOLO_octron:
         resume : bool
             If True, resume training from the loaded checkpoint (last.pt).
             Most training parameters are restored from the checkpoint.
-            
+        run_name : str
+            Name of the training run subdirectory inside ``training_path``.
+            Defaults to ``'training'`` (preserves GUI behaviour). CLI runs
+            pass an informative name such as ``'yolo26m_seg_640_20260327'``.
+
         Yields
         ------
         dict
@@ -1160,6 +1134,17 @@ class YOLO_octron:
             for callback_name in ['on_fit_epoch_end', 'on_train_start', 'on_train_end']:
                 if callback_name in self.model.callbacks:
                     self.model.callbacks.pop(callback_name, None)
+
+        # Callback to log the batch size chosen by ultralytics AutoBatch
+        def _on_train_start(trainer):
+            try:
+                chosen = getattr(trainer, 'batch_size', None)
+                if chosen is None:
+                    chosen = getattr(trainer.args, 'batch', None)
+                if chosen is not None:
+                    logger.info(f"Batch size: {chosen}")
+            except Exception:
+                pass
                     
         # Setup a queue to receive yielded values from the callback
         progress_queue = queue.Queue()
@@ -1235,19 +1220,28 @@ class YOLO_octron:
             """
             data_path = Path(data_path)
             assert data_path.exists(), f"Data path {data_path} does not exist."
-            png_files = list(data_path.glob('**/*.png'))
-            if len(png_files) == 0:
-                raise FileNotFoundError(f"No .png files found in {data_path.as_posix()}")
-            logger.debug(f'Found {len(png_files)} png files')
-            samples = random.sample(png_files, min(max_samples, len(png_files)))
+            image_files = (
+                list(data_path.glob('**/*.png'))
+                + list(data_path.glob('**/*.jpg'))
+                + list(data_path.glob('**/*.jpeg'))
+            )
+            if len(image_files) == 0:
+                raise FileNotFoundError(f"No image files (.png/.jpg) found in {data_path.as_posix()}")
+            logger.debug(f'Found {len(image_files)} image files')
+            samples = random.sample(image_files, min(max_samples, len(image_files)))
 
             widths, heights = [], []
             for fpath in samples:
-                # Read width/height directly from PNG IHDR chunk (bytes 16-23)
-                # I had it on PIL.Image.open() per file first, but this is very slow ... 
-                with open(fpath, 'rb') as f:
-                    f.seek(16)
-                    w, h = struct.unpack('>II', f.read(8))
+                if fpath.suffix.lower() == '.png':
+                    # Read width/height directly from PNG IHDR chunk (bytes 16-23)
+                    # I had it on PIL.Image.open() per file first, but this is very slow ...
+                    with open(fpath, 'rb') as f:
+                        f.seek(16)
+                        w, h = struct.unpack('>II', f.read(8))
+                else:
+                    from PIL import Image
+                    with Image.open(fpath) as img:
+                        w, h = img.size
                 widths.append(w)
                 heights.append(h)
             
@@ -1261,8 +1255,25 @@ class YOLO_octron:
             
             return avg_h, avg_w, rect
 
+        # Remove any stale ultralytics disk-cache .npy files from the training
+        # data directory before starting.  ultralytics cache='disk' writes
+        # <stem>.npy files alongside source images, and BaseDataset.load_image
+        # will silently load any matching .npy it finds — even when cache='disk'
+        # is not set — instead of reading the actual image file.  Purging them
+        # here ensures a clean cache rebuild each training run.
+        if self.data_path and self.data_path.exists():
+            stale_npy = list(self.data_path.glob('**/*.npy'))
+            if stale_npy:
+                logger.warning(
+                    f"Found {len(stale_npy)} stale .npy cache file(s) in training data "
+                    "directory — removing before training starts."
+                )
+                for f in stale_npy:
+                    f.unlink()
+
         self.model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
         self.model.add_callback("on_train_end", _on_train_end)
+        self.model.add_callback("on_train_start", _on_train_start)
         
         if self.config_path is None or not self.config_path.exists():
             raise FileNotFoundError(
@@ -1282,12 +1293,23 @@ class YOLO_octron:
             # https://docs.ultralytics.com/modes/train/#resuming-interrupted-trainings
             # overlap_mask - https://github.com/ultralytics/ultralytics/issues/3213#issuecomment-2799841153
             nonlocal training_error
+            # Re-apply our logging configuration.  ultralytics installs its own
+            # loguru handler when first imported; calling setup_logging() here
+            # (after import, inside the training thread) evicts it so all output
+            # flows through our single, consistently-filtered handler.
+            from octron._logging import setup_logging as _setup_logging
+            _setup_logging(debug=debug)
             try:
                 img_height, img_width, rect = _find_train_image_size(self.data_path)
                 # Start training
                 logger.info(f"Starting training for {epochs} epochs...")
                 logger.info(f"Setting rect={rect} based on training image size of {img_width}x{img_height} (wxh)")
                 logger.info(f"Using device: {device}")
+                if batch == -1:
+                    logger.info(
+                        "Batch size: auto — ultralytics will probe VRAM to find the "
+                        "optimal size before the first epoch (may take a minute or two)."
+                    )
                 logger.info("################################################################")
                 # Build training kwargs — shared between segment and detect
                 # When rect=True, images in different batches have different padded heights
@@ -1298,7 +1320,7 @@ class YOLO_octron:
                 copy_paste_prob = 0.0 if rect else 0.25
                 train_kwargs = dict(
                     data=self.config_path.as_posix() if self.config_path is not None else '',
-                    name='training',
+                    name=run_name,
                     project=self.training_path.as_posix() if self.training_path is not None else '',
                     mode=train_mode,
                     device=device,
@@ -1316,6 +1338,7 @@ class YOLO_octron:
                     save=True,
                     save_period=save_period,
                     exist_ok=True,
+                    verbose=debug,  # suppress architecture table and param dump unless --debug
                     nms=False,
                     max_det=2000, # Increasing this for dense scenes - I think it might affect val too
                     # Augmentation
@@ -1337,8 +1360,18 @@ class YOLO_octron:
                 )
                 # Segmentation-specific parameters
                 if train_mode == 'segment':
-                    train_kwargs['mask_ratio'] = 2
+                    # mask_ratio=1 matches the YOLO26 prototype head's design
+                    # resolution. Using mask_ratio=2 causes YOLO26's mask
+                    # predictions to be at half the expected resolution, which
+                    # prevents any mask IoU threshold from being met during
+                    # validation — resulting in mask metrics = 0 for all epochs.
+                    train_kwargs['mask_ratio'] = 1
                     train_kwargs['overlap_mask'] = True
+                    # Note: YOLO26 was trained with semseg_loss=True in its
+                    # custom ultralytics fork, but the standard ultralytics
+                    # rejects it as an unrecognised argument. Since the standard
+                    # trainer has no semantic-loss code, sem_loss is not computed
+                    # at all — no action needed here.
 
                 self.model.train(**train_kwargs)
             except Exception as e:
