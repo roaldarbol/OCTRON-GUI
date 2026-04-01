@@ -453,6 +453,8 @@ def run_tracklets(
     end=None,
     min_track_frames=0,
     interpolate_max_gap=0,
+    track_ids=None,
+    min_observations=0,
     debug=False,
 ):
     """
@@ -557,6 +559,16 @@ def run_tracklets(
         skipped_min = len(active_tids) - len(render_tids)
         logger.info(f"Keeping {len(render_tids)}/{len(active_tids)} tracks with ≥{min_track_frames} frames ({skipped_min} skipped)")
 
+    if track_ids is not None:
+        missing = set(track_ids) - set(render_tids)
+        if missing:
+            logger.warning(f"Requested track ID(s) not found: {sorted(missing)}")
+        render_tids = [t for t in render_tids if t in set(track_ids)]
+    if min_observations > 0:
+        render_tids = [t for t in render_tids if len(pos_lookup.get(t, {})) >= min_observations]
+    if track_ids is not None or min_observations > 0:
+        logger.info(f"Rendering {len(render_tids)}/{len(results.track_ids)} track(s) after filtering")
+
     if mask_centroids and results.has_masks:
         logger.info("Computing mask centre-of-mass centroids...")
         mask_cent = compute_mask_centroids(
@@ -582,7 +594,7 @@ def run_tracklets(
         interpolate_tracklet_gaps(pos_lookup, max_gap=interpolate_max_gap)
 
     track_colors = {}
-    for tid in active_tids:
+    for tid in render_tids:
         rgba, _ = results.get_color_for_track_id(tid)
         r, g, b = int(rgba[0] * 255), int(rgba[1] * 255), int(rgba[2] * 255)
         track_colors[tid] = (b, g, r)
@@ -610,7 +622,7 @@ def run_tracklets(
     _mask_inf_h = _mask_inf_w = None
     _lb_py = _lb_px = _lb_ch = _lb_cw = 0
     if also_overlay and draw_masks and results.has_masks:
-        for tid in active_tids:
+        for tid in render_tids:
             arr_key = f"{tid}_masks"
             if arr_key in results.zarr_root:
                 _mask_inf_h, _mask_inf_w = results.zarr_root[arr_key].shape[1:3]
@@ -629,7 +641,7 @@ def run_tracklets(
     if also_overlay and draw_masks and results.has_masks:
         logger.info("Starting mask prefetch thread...")
         _mask_q = _start_mask_prefetch(
-            results.zarr_root, active_tids,
+            results.zarr_root, render_tids,
             frame_start, frame_end, _BATCH,
         )
         _first = _mask_q.get(timeout=120)
@@ -691,7 +703,7 @@ def run_tracklets(
                 _comb_mask = np.zeros((_mask_inf_h, _mask_inf_w), dtype=np.uint8)
                 _comb_color = np.zeros((_mask_inf_h, _mask_inf_w, 3), dtype=np.uint8)
                 _drew_any = False
-                for tid in active_tids:
+                for tid in render_tids:
                     if tid in _batch_masks:
                         batch = _batch_masks[tid]
                         if j < batch.shape[0]:
@@ -713,7 +725,7 @@ def run_tracklets(
             else:
                 out_frame = frame_small.copy()
 
-            for tid in active_tids:
+            for tid in render_tids:
                 color_bgr = track_colors[tid]
                 if draw_boxes:
                     row = bbox_lookup.get(tid, {}).get(frame_idx)
@@ -799,6 +811,8 @@ def run_render(
     tracklet_smooth_order=4,
     tracklet_min_frames=0,
     tracklet_interpolate_max_gap=0,
+    track_ids=None,
+    min_observations=0,
     alpha=0.4,
     draw_masks=True,
     draw_boxes=True,
@@ -868,6 +882,8 @@ def run_render(
             end=end,
             min_track_frames=tracklet_min_frames,
             interpolate_max_gap=tracklet_interpolate_max_gap,
+            track_ids=track_ids,
+            min_observations=min_observations,
             debug=debug,
         )
         return
@@ -920,8 +936,19 @@ def run_render(
         + (f" ({skipped} skipped — no detections in frames {frame_start}–{frame_end})" if skipped else "")
     )
 
+    render_tids = list(active_tids)
+    if track_ids is not None:
+        missing = set(track_ids) - set(render_tids)
+        if missing:
+            logger.warning(f"Requested track ID(s) not found: {sorted(missing)}")
+        render_tids = [t for t in render_tids if t in set(track_ids)]
+    if min_observations > 0:
+        render_tids = [t for t in render_tids if len(bbox_lookup.get(t, {})) >= min_observations]
+    if track_ids is not None or min_observations > 0:
+        logger.info(f"Rendering {len(render_tids)}/{len(results.track_ids)} track(s) after filtering")
+
     track_colors = {}
-    for tid in active_tids:
+    for tid in render_tids:
         rgba, _ = results.get_color_for_track_id(tid)
         r, g, b = int(rgba[0] * 255), int(rgba[1] * 255), int(rgba[2] * 255)
         track_colors[tid] = (b, g, r)
@@ -946,7 +973,7 @@ def run_render(
     _mask_inf_h = _mask_inf_w = None
     _lb_py = _lb_px = _lb_ch = _lb_cw = 0
     if draw_masks and results.has_masks:
-        for tid in active_tids:
+        for tid in render_tids:
             arr_key = f"{tid}_masks"
             if arr_key in results.zarr_root:
                 _mask_inf_h, _mask_inf_w = results.zarr_root[arr_key].shape[1:3]
@@ -977,7 +1004,7 @@ def run_render(
     if draw_masks and results.has_masks:
         logger.info("Starting mask prefetch thread...")
         _mask_q = _start_mask_prefetch(
-            results.zarr_root, active_tids,
+            results.zarr_root, render_tids,
             frame_start, frame_end, _BATCH,
         )
         # Pull first batch — blocks for initial load (batch_size frames only)
@@ -1042,7 +1069,7 @@ def run_render(
             _comb_mask = np.zeros((_mask_inf_h, _mask_inf_w), dtype=np.uint8)
             _comb_color = np.zeros((_mask_inf_h, _mask_inf_w, 3), dtype=np.uint8)
             _drew_any = False
-            for tid in active_tids:
+            for tid in render_tids:
                 if tid in _batch_masks:
                     batch = _batch_masks[tid]
                     if j < batch.shape[0]:
@@ -1065,7 +1092,7 @@ def run_render(
         else:
             out_frame = frame_small.copy()
 
-        for tid in active_tids:
+        for tid in render_tids:
             color_bgr = track_colors[tid]
             label = results.track_id_label[tid]
 
