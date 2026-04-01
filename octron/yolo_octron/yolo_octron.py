@@ -2369,21 +2369,19 @@ class YOLO_octron:
                                 mask_buffer_frame_map[track_id] = {}
                                 mask_stores[track_id] = mask_store
 
-                            # Initialize pre-allocated column arrays for this track.
-                            # Sized to the total frame count (upper bound on detections).
-                            _nf = video_dict['num_frames']
+                            # Use lists that grow as detections arrive — no upfront allocation.
                             tracking_cols[track_id] = {
-                                'frame_counter':     np.empty(_nf, dtype='int32'),
-                                'frame_idx':         np.empty(_nf, dtype='int32'),
-                                'pos_x':             np.empty(_nf, dtype='float64'),
-                                'pos_y':             np.empty(_nf, dtype='float64'),
-                                'bbox_area':         np.empty(_nf, dtype='float64'),
-                                'bbox_aspect_ratio': np.empty(_nf, dtype='float64'),
-                                'bbox_x_min':        np.empty(_nf, dtype='float64'),
-                                'bbox_x_max':        np.empty(_nf, dtype='float64'),
-                                'bbox_y_min':        np.empty(_nf, dtype='float64'),
-                                'bbox_y_max':        np.empty(_nf, dtype='float64'),
-                                'confidence':        np.empty(_nf, dtype='float64'),
+                                'frame_counter':     [],
+                                'frame_idx':         [],
+                                'pos_x':             [],
+                                'pos_y':             [],
+                                'bbox_area':         [],
+                                'bbox_aspect_ratio': [],
+                                'bbox_x_min':        [],
+                                'bbox_x_max':        [],
+                                'bbox_y_min':        [],
+                                'bbox_y_max':        [],
+                                'confidence':        [],
                             }
                             tracking_col_fills[track_id] = 0
                             tracking_frame_no_slot[track_id] = {}
@@ -2446,29 +2444,40 @@ class YOLO_octron:
                             if mask_buffer_fills[track_id] >= buffer_size:
                                 _flush_mask_buffer(track_id)
 
-                        # Write tracking data into pre-allocated column arrays.
+                        # Write tracking data into column lists.
                         # Reuse the existing slot for duplicate frame_no (overwrite),
                         # append a new slot otherwise.
                         bbox_w = bbox[2] - bbox[0]
                         bbox_h = bbox[3] - bbox[1]
+                        _cols = tracking_cols[track_id]
                         if _dup_slot is not None:
                             _col_slot = _dup_slot
+                            _cols['frame_counter'][_col_slot]     = frame_no
+                            _cols['frame_idx'][_col_slot]         = frame_idx
+                            _cols['pos_x'][_col_slot]             = (bbox[0] + bbox[2]) * 0.5
+                            _cols['pos_y'][_col_slot]             = (bbox[1] + bbox[3]) * 0.5
+                            _cols['bbox_area'][_col_slot]         = bbox_w * bbox_h
+                            _cols['bbox_aspect_ratio'][_col_slot] = bbox_w / bbox_h if bbox_h > 0 else np.nan
+                            _cols['bbox_x_min'][_col_slot]        = float(bbox[0])
+                            _cols['bbox_x_max'][_col_slot]        = float(bbox[2])
+                            _cols['bbox_y_min'][_col_slot]        = float(bbox[1])
+                            _cols['bbox_y_max'][_col_slot]        = float(bbox[3])
+                            _cols['confidence'][_col_slot]        = conf
                         else:
                             _col_slot = tracking_col_fills[track_id]
                             tracking_frame_no_slot[track_id][frame_no] = _col_slot
                             tracking_col_fills[track_id] = _col_slot + 1
-                        _cols = tracking_cols[track_id]
-                        _cols['frame_counter'][_col_slot]     = frame_no
-                        _cols['frame_idx'][_col_slot]         = frame_idx
-                        _cols['pos_x'][_col_slot]             = (bbox[0] + bbox[2]) * 0.5
-                        _cols['pos_y'][_col_slot]             = (bbox[1] + bbox[3]) * 0.5
-                        _cols['bbox_area'][_col_slot]         = bbox_w * bbox_h
-                        _cols['bbox_aspect_ratio'][_col_slot] = bbox_w / bbox_h if bbox_h > 0 else np.nan
-                        _cols['bbox_x_min'][_col_slot]        = float(bbox[0])
-                        _cols['bbox_x_max'][_col_slot]        = float(bbox[2])
-                        _cols['bbox_y_min'][_col_slot]        = float(bbox[1])
-                        _cols['bbox_y_max'][_col_slot]        = float(bbox[3])
-                        _cols['confidence'][_col_slot]        = conf
+                            _cols['frame_counter'].append(frame_no)
+                            _cols['frame_idx'].append(frame_idx)
+                            _cols['pos_x'].append((bbox[0] + bbox[2]) * 0.5)
+                            _cols['pos_y'].append((bbox[1] + bbox[3]) * 0.5)
+                            _cols['bbox_area'].append(bbox_w * bbox_h)
+                            _cols['bbox_aspect_ratio'].append(bbox_w / bbox_h if bbox_h > 0 else np.nan)
+                            _cols['bbox_x_min'].append(float(bbox[0]))
+                            _cols['bbox_x_max'].append(float(bbox[2]))
+                            _cols['bbox_y_min'].append(float(bbox[1]))
+                            _cols['bbox_y_max'].append(float(bbox[3]))
+                            _cols['confidence'].append(conf)
 
                         # If region_properties or extra_properties are specified, supplement info from regionprops extraction
                         # (only available for segmentation models with masks)
@@ -2580,8 +2589,7 @@ class YOLO_octron:
                 # Write annotated_frames attr once per track — doing this after all writes avoids
                 # repeated read-modify-sort-write of a growing JSON list on every hot-path flush.
                 for track_id in all_ids:
-                    _n = tracking_col_fills[track_id]
-                    written_idxs = sorted(set(tracking_cols[track_id]['frame_idx'][:_n].tolist()))
+                    written_idxs = sorted(set(tracking_cols[track_id]['frame_idx']))
                     mark_frames_annotated(mask_stores[track_id], written_idxs)
                 
             if _n_no_result:
@@ -2589,12 +2597,25 @@ class YOLO_octron:
             if _n_no_track:
                 logger.debug(f"{_n_no_track} frame(s) had detections but no confirmed tracks (tracker warmup or low confidence).")
 
-            # Build DataFrames from pre-allocated column arrays (one allocation per track per video)
+            # Build DataFrames from column lists (converted to numpy arrays here)
+            _col_dtypes = {
+                'frame_counter':     'int32',
+                'frame_idx':         'int32',
+                'pos_x':             'float32',
+                'pos_y':             'float32',
+                'bbox_area':         'float32',
+                'bbox_aspect_ratio': 'float32',
+                'bbox_x_min':        'float32',
+                'bbox_x_max':        'float32',
+                'bbox_y_min':        'float32',
+                'bbox_y_max':        'float32',
+                'confidence':        'float32',
+            }
             import pandas as pd
             for track_id in all_ids:
                 _n = tracking_col_fills[track_id]
                 if _n > 0:
-                    _df_data = {k: v[:_n].copy() for k, v in tracking_cols[track_id].items()}
+                    _df_data = {k: np.array(v, dtype=_col_dtypes[k]) for k, v in tracking_cols[track_id].items()}
                     _df_data['track_id'] = np.full(_n, track_id, dtype='int32')
                     df = pd.DataFrame(_df_data)
                     # Merge sparse extra region-props (region_details path only)
