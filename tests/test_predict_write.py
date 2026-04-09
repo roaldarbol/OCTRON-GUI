@@ -229,7 +229,7 @@ def test_concurrent_write_workers():
 def test_predict_debug_flag_in_help():
     from typer.testing import CliRunner
     from octron.cli import app
-    runner = CliRunner(env={"COLUMNS": "200"})
+    runner = CliRunner(env={"COLUMNS": "200", "NO_COLOR": "1"}, mix_stderr=False)
     result = runner.invoke(app, ['predict', '--help'])
     assert result.exit_code == 0
     assert '--debug' in result.output
