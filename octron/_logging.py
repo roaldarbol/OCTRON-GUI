@@ -47,7 +47,7 @@ def setup_logging(debug: bool = False) -> None:
         sys.stderr,
         level=level,
         format=fmt,
-        colorize=True,
+        colorize=None,
         enqueue=False,
     )
 
