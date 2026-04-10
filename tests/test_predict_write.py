@@ -227,8 +227,14 @@ def test_concurrent_write_workers():
 # ---------------------------------------------------------------------------
 
 def test_predict_debug_flag_in_help():
-    from typer.testing import CliRunner
+    from typer.testing import CliRunner as _CliRunner
     from octron.cli import app
+
+    class CliRunner(_CliRunner):
+        def invoke(self, *args, **kwargs):
+            kwargs.setdefault("color", False)
+            return super().invoke(*args, **kwargs)
+
     runner = CliRunner(env={"COLUMNS": "200", "NO_COLOR": "1"})
     result = runner.invoke(app, ['predict', '--help'])
     assert result.exit_code == 0

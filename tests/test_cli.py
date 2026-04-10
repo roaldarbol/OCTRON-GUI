@@ -29,10 +29,20 @@ auto_device returns 'cuda', 'mps', or 'cpu' (skipped if torch unavailable)
 """
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner as _CliRunner
 from octron.cli import app
 
-# Wide terminal so Rich/typer never truncates long flag names in help output
+
+class CliRunner(_CliRunner):
+    """CliRunner that defaults to color=False so Rich/Typer never emit ANSI
+    escape codes that would split --flag strings in help output."""
+
+    def invoke(self, *args, **kwargs):
+        kwargs.setdefault("color", False)
+        return super().invoke(*args, **kwargs)
+
+
+# Wide terminal so Typer/Rich never wraps long flag names in help output.
 runner = CliRunner(env={"COLUMNS": "200", "NO_COLOR": "1"})
 
 
