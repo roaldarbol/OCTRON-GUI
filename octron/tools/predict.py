@@ -21,22 +21,36 @@ def _is_network_path(path) -> bool:
 
 
 def _transfer_results(temp_root: Path, final_root: Path) -> None:
-    """Move completed octron_predictions/ sub-folders from *temp_root* to *final_root*.
+    """Move completed prediction sub-folders from *temp_root* to *final_root*.
 
-    Each video writes one sub-folder inside octron_predictions/.  We move them
-    one at a time so that a partial transfer (e.g. after interrupt) leaves as
-    many complete video results as possible on the destination.
+    When output_dir was given, predict_batch writes results directly under
+    temp_root (no octron_predictions/ level).  When output_dir was not given,
+    results are nested under temp_root/octron_predictions/ and must be moved
+    to final_root/octron_predictions/.  We detect which layout was used and
+    move folders one at a time so a partial transfer leaves as many complete
+    video results as possible on the destination.
     """
-    src = temp_root / "octron_predictions"
-    if not src.exists():
-        return
-    dst_parent = final_root / "octron_predictions"
-    dst_parent.mkdir(parents=True, exist_ok=True)
-    for item in sorted(src.iterdir()):
-        dst = dst_parent / item.name
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.move(str(item), str(dst))
+    src_nested = temp_root / "octron_predictions"
+    if src_nested.exists():
+        # No output_dir: preserve octron_predictions/ structure alongside videos.
+        dst_parent = final_root / "octron_predictions"
+        dst_parent.mkdir(parents=True, exist_ok=True)
+        for item in sorted(src_nested.iterdir()):
+            dst = dst_parent / item.name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.move(str(item), str(dst))
+    else:
+        # output_dir given: results are directly under temp_root.
+        # Skip the 'videos' sub-dir used by the video cache.
+        final_root.mkdir(parents=True, exist_ok=True)
+        for item in sorted(temp_root.iterdir()):
+            if item.name == "videos":
+                continue
+            dst = final_root / item.name
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.move(str(item), str(dst))
 
 
 def run_predict(
@@ -57,7 +71,9 @@ def run_predict(
     infer_batch_size=8,
     output_dir=None,
     debug=False,
-    local_cache_dir=None,
+    zarr_cache=None,
+    video_cache=None,
+    temp_dir=None,
 ):
     """
     Run YOLO prediction and tracking on one or more videos.
@@ -102,14 +118,21 @@ def run_predict(
         each video file.
     debug : bool
         Enable DEBUG-level logging (per-stage timing diagnostics).
-    local_cache_dir : str or Path, optional
-        Write zarr output here first, then move to *output_dir* after each
-        video completes.  Automatically enabled when *output_dir* is a UNC /
-        network path (``\\\\server\\share`` or ``//server/share``).  Pass an
-        explicit path to force caching even for local network drives or to
-        choose which local volume is used (e.g. your NVMe scratch space).
-        The cache directory is always deleted on exit, whether prediction
-        finishes normally, is interrupted, or crashes.
+    zarr_cache : bool or None
+        Cache zarr output to a local temp dir, then move to *output_dir* when
+        each video finishes.  Avoids SMB atomic-write (os.replace) failures on
+        network shares.  ``None`` (default) auto-enables when *output_dir* is a
+        UNC / network path.  ``False`` suppresses auto-detection.
+    video_cache : bool or None
+        Copy each video to a local temp dir before decoding.  Eliminates
+        network read bottlenecks for high-resolution or high-bitrate videos.
+        ``None`` (default) auto-enables when the input video path is a UNC /
+        network path.  ``False`` suppresses auto-detection.
+    temp_dir : str or Path, optional
+        Parent directory for the cache temp folder.  Defaults to the system
+        temp dir (``tempfile.gettempdir()``).  Override with a path on a fast
+        local drive when the system temp dir is a network-redirected profile
+        folder (common in managed Windows environments).
     """
     from loguru import logger
     from octron.yolo_octron.yolo_octron import YOLO_octron
@@ -122,26 +145,49 @@ def run_predict(
         device = auto_device()
 
     yolo = YOLO_octron()
+    # ultralytics replaces the loguru handler during import; re-establish ours.
+    from octron._logging import setup_logging as _setup_logging
+    _setup_logging(debug=debug)
 
     # --- local-cache setup ---------------------------------------------------
-    # Zarr uses atomic-write (write tmp, then os.replace) which fails on SMB /
-    # network shares on Windows.  Writing to a local temp dir and moving the
-    # completed folder to the network destination avoids this entirely.
+    # zarr_cache: write zarr output to a local temp dir, then move to output_dir.
+    #   Required on SMB/network shares because zarr uses os.replace() which
+    #   fails on Windows SMB.  Auto-enabled when output_dir is a network path.
+    # video_cache: copy the video file locally before the decode thread opens
+    #   it.  Eliminates network read bottlenecks for large/high-res videos.
+    #   Auto-enabled when the input video path is a network path.
+    # Both share a single temp dir to keep cleanup simple.
     _temp_dir: Path | None = None
-    _final_output_dir = Path(output_dir) if output_dir is not None else None
-    _needs_cache = local_cache_dir is not None or (
-        _final_output_dir is not None and _is_network_path(_final_output_dir)
-    )
+    # Resolve to absolute path so that relative paths under a network working
+    # directory (e.g. "data/tracking/" when cwd is \\server\share\...) are
+    # correctly identified as network paths by _is_network_path().
+    _final_output_dir = Path(output_dir).resolve() if output_dir is not None else None
 
-    if _needs_cache:
-        if local_cache_dir is not None:
-            _temp_dir = Path(local_cache_dir) / f"octron_cache_{os.getpid()}"
-            _temp_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            _temp_dir = Path(tempfile.mkdtemp(prefix="octron_cache_"))
-        effective_output_dir = str(_temp_dir)
-        logger.info(f"Local cache:  {_temp_dir}")
-        logger.info(f"Destination:  {_final_output_dir}")
+    # Normalise videos to a flat list of Paths for network-path detection.
+    if isinstance(videos, (str, Path)):
+        _video_list: list[Path] = [Path(videos).resolve()]
+    elif isinstance(videos, list):
+        _video_list = [Path(v).resolve() for v in videos]
+    else:
+        _video_list = []  # dict format (GUI): skip auto-detection on video paths
+
+    # Resolve each cache flag: explicit True/False overrides auto-detection;
+    # None means "decide based on path".
+    _do_zarr_cache: bool = (
+        zarr_cache
+        if zarr_cache is not None
+        else (
+            (_final_output_dir is not None and _is_network_path(_final_output_dir))
+            or (_final_output_dir is None and any(_is_network_path(v) for v in _video_list))
+        )
+    )
+    _do_video_cache: bool = video_cache if video_cache is not None else False
+
+    if _do_zarr_cache or _do_video_cache:
+        _mkdtemp_kwargs = {"prefix": "octron_cache_"}
+        if temp_dir is not None:
+            _mkdtemp_kwargs["dir"] = str(temp_dir)
+        _temp_dir = Path(tempfile.mkdtemp(**_mkdtemp_kwargs))
 
         # Belt-and-suspenders: also register an atexit handler so the temp dir
         # is cleaned up even if the process is killed before the finally block
@@ -151,6 +197,16 @@ def run_predict(
                 shutil.rmtree(_temp_dir, ignore_errors=True)
 
         atexit.register(_atexit_cleanup)
+
+        if _do_zarr_cache:
+            effective_output_dir = str(_temp_dir)
+            _dest_label = str(_final_output_dir) if _final_output_dir else "(alongside videos)"
+            logger.info(f"Zarr cache:   {_temp_dir}  →  {_dest_label}")
+        else:
+            effective_output_dir = output_dir
+
+        if _do_video_cache:
+            logger.info(f"Video cache:  {_temp_dir / 'videos'}")
     else:
         effective_output_dir = output_dir
     # -------------------------------------------------------------------------
@@ -182,7 +238,7 @@ def run_predict(
 
     def _flush_cache(label: str = "") -> None:
         """Transfer completed results from the local cache to the destination."""
-        if _temp_dir is None or _final_output_dir is None:
+        if not _do_zarr_cache or _temp_dir is None or _final_output_dir is None:
             return
         _close_progress()
         _t0 = time.time()
@@ -209,6 +265,8 @@ def run_predict(
             region_properties=region_properties,
             infer_batch_size=infer_batch_size,
             output_dir=effective_output_dir,
+            video_cache_dir=str(_temp_dir / "videos") if _do_video_cache and _temp_dir is not None else None,
+            debug=debug,
         ):
             stage = progress.get("stage", "")
 
@@ -247,7 +305,12 @@ def run_predict(
                 _close_progress()
                 logger.info(f"Video {vidx}/{total_v}: {video_name}")
                 logger.info(f"Frames:   {num_frames:,}")
-                logger.info(f"Output:   {save_dir if not _temp_dir else str(_final_output_dir / 'octron_predictions' / Path(save_dir).name)}")
+                _display_out = (
+                    str(_final_output_dir / Path(save_dir).name)
+                    if _temp_dir and _final_output_dir
+                    else save_dir
+                )
+                logger.info(f"Output:   {_display_out}")
                 continue
 
             if stage == "skipped_video":
@@ -271,7 +334,7 @@ def run_predict(
             _fps_ts.append(now_t)
             while _fps_ts[0] < now_t - _FPS_WINDOW:
                 _fps_ts.popleft()
-            if len(_fps_ts) >= 2:
+            if len(_fps_ts) >= 2 and _fps_ts[-1] > _fps_ts[0]:
                 fps = (len(_fps_ts) - 1) / (_fps_ts[-1] - _fps_ts[0])
             else:
                 fps = 0.0

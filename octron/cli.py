@@ -60,15 +60,13 @@ app = typer.Typer(
 @app.callback()
 def default(ctx: typer.Context):
     """Launch the OCTRON napari GUI (default), or run a subcommand."""
-    # ctx.resilient_parsing is True during shell-completion parsing.
-    # ctx.args contains args that will be forwarded to the subcommand (e.g. ['--help']).
-    # Using ctx.args works with both real sys.argv and typer.testing.CliRunner.
-    _remaining = list(ctx.protected_args or []) + list(ctx.args or [])
-    if not ctx.resilient_parsing and "--help" not in _remaining and "-h" not in _remaining:
-        from octron._logging import setup_logging, print_welcome
-        setup_logging()
-        print_welcome()
+    if ctx.resilient_parsing:
+        return
+    from octron._logging import setup_logging
+    setup_logging()
     if ctx.invoked_subcommand is None:
+        from octron._logging import print_welcome
+        print_welcome()
         logger.info("Loading libraries (this may take a moment)...")
         from octron.main import octron_gui
 
@@ -164,11 +162,17 @@ def predict(
     opening_radius: int = typer.Option(0, help="Morphological opening radius applied to masks."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing prediction results. Default: skip videos that already have predictions."),
     detailed: bool = typer.Option(False, "--detailed", help="Extract detailed region properties (area, eccentricity, solidity, …) from segmentation masks via scikit-image. Ignored for detection models."),
-    buffer_size: int = typer.Option(500, help="Frame buffer size before writing to zarr."),
+    buffer_size: int = typer.Option(200, help="Frames buffered per track before flushing to zarr (also sets the zarr chunk size). Larger values mean fewer, better-compressed writes."),
+    infer_batch_size: int = typer.Option(8, "--infer-batch-size", help="Number of frames per inference batch. Larger values increase GPU utilisation."),
     output_dir: Optional[Path] = typer.Option(None, "--output-dir", "-o", help="Directory where octron_predictions/ folders are written. Defaults to alongside each video file."),
-    local_cache_dir: Optional[Path] = typer.Option(None, "--local-cache-dir", help="Write zarr output here first, then move to --output-dir when each video finishes. Enabled automatically for network/UNC paths. Useful for NVMe scratch space."),
+    local_cache: Optional[bool] = typer.Option(None, "--local-cache/--no-local-cache", help="Cache zarr output to a local temp dir, then move to --output-dir when done. Avoids SMB atomic-write failures. Auto-enabled when --output-dir is a network/UNC path."),
+    video_cache: Optional[bool] = typer.Option(None, "--video-cache/--no-video-cache", help="Copy each video to a local temp dir before decoding. Eliminates network read bottlenecks for high-resolution videos. Auto-enabled when the video path is a network/UNC path."),
+    temp_dir: Optional[Path] = typer.Option(None, "--temp-dir", help="Parent directory for the cache temp folder. Override when the system temp dir is a slow network-redirected profile (common in managed Windows environments). Example: D:\\temp"),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logging (per-stage timing diagnostics)."),
 ):
     """Run YOLO prediction and tracking on one or more videos."""
+    from octron._logging import setup_logging
+    setup_logging(debug=debug)
     from octron.tools.predict import run_predict
     from octron.test_gpu import auto_device
 
@@ -222,8 +226,12 @@ def predict(
         overwrite=overwrite,
         buffer_size=buffer_size,
         region_properties=DEFAULT_REGION_PROPERTIES if detailed else None,
+        infer_batch_size=infer_batch_size,
         output_dir=output_dir,
-        local_cache_dir=local_cache_dir,
+        zarr_cache=local_cache,
+        video_cache=video_cache,
+        temp_dir=temp_dir,
+        debug=debug,
     )
 
 
