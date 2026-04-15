@@ -2482,10 +2482,19 @@ class YOLO_octron:
                         # If region_properties or extra_properties are specified, supplement info from regionprops extraction
                         # (only available for segmentation models with masks)
                         if region_details and is_segment:
+                            # mask is at inference resolution; frame is at video resolution.
+                            # skimage regionprops requires matching spatial dimensions.
+                            intensity_frame = frame
+                            if frame is not None and frame.shape[:2] != mask.shape[:2]:
+                                import cv2 as _cv2
+                                intensity_frame = _cv2.resize(
+                                    frame, (mask.shape[1], mask.shape[0]),
+                                    interpolation=_cv2.INTER_AREA,
+                                )
                             _, regions_props = find_objects_in_mask(
                                 mask, min_area=0,
                                 properties=region_properties,
-                                intensity_image=frame,
+                                intensity_image=intensity_frame,
                                 extra_properties=extra_properties,
                             )
                             if not regions_props:
