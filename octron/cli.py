@@ -232,7 +232,6 @@ class Method(str, Enum):
     raw      = "raw"
     largest  = "largest"
     weighted = "weighted"
-    mask_com = "mask_com"
 
 
 class Format(str, Enum):
@@ -264,8 +263,7 @@ def export(
             "'raw': keep tuple-strings unchanged (default; matches the original "
             "predict output, no info loss). "
             "'largest': use values from the single largest segment. "
-            "'weighted': area-weighted mean across all segments. "
-            "'mask_com': centre-of-mass from zarr masks for pos_x/y (most robust)."
+            "'weighted': area-weighted mean across all segments."
         ),
     ),
     region_properties: Optional[str] = typer.Option(
@@ -377,10 +375,6 @@ def render(
     # --- Tracklet options ---
     tracklets: bool = typer.Option(False, "--tracklets", help="Generate one crop video per tracked animal."),
     tracklet_size: Optional[str] = typer.Option("auto", "--tracklet-size", help="Side length in pixels of each tracklet crop, or 'auto' to use the largest bounding box + 20px padding."),
-    tracklet_mask_centroids: bool = typer.Option(
-        False, "--tracklet-mask-centroids",
-        help="Use mask centre-of-mass instead of bbox centre for tracklet positioning.",
-    ),
     tracklet_smooth_cutoff_hz: float = typer.Option(
         2.0, "--tracklet-smooth-cutoff", help="Butterworth low-pass cutoff (Hz) for centroid smoothing. 0=off.",
     ),
@@ -461,7 +455,6 @@ def render(
         tracklets=tracklets,
         also_overlay=resolved_masks or resolved_boxes,
         tracklet_size=parsed_tracklet_size,
-        tracklet_mask_centroids=tracklet_mask_centroids,
         tracklet_smooth_cutoff_hz=tracklet_smooth_cutoff_hz,
         tracklet_smooth_order=tracklet_smooth_order,
         tracklet_interpolate_max_gap=tracklet_interpolate,

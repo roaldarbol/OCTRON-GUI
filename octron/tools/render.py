@@ -112,9 +112,7 @@ def _start_mask_prefetch(zarr_root, track_ids, frame_start, frame_end, batch_siz
     return q
 
 
-# _letterbox_bounds and compute_mask_centroids live in export_tracking so they
-# can be used by both the render pipeline and the CSV export pipeline.
-from octron.tools.export_tracking import _letterbox_bounds, compute_mask_centroids  # noqa: F401
+from octron.tools.export_tracking import compute_weighted_centroids
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +315,6 @@ def run_tracklets(
     preset="draft",
     also_overlay=False,
     size=None,
-    mask_centroids=False,
     smooth_cutoff_hz=2.0,
     smooth_order=4,
     alpha=0.4,
@@ -358,9 +355,6 @@ def run_tracklets(
         inspecting centroid placement).  Default False.
     size : int
         Side length in pixels of each square tracklet crop.  Default 160.
-    mask_centroids : bool
-        If True, replace bbox-derived centroid positions with the centre-of-mass
-        computed from the segmentation masks.  Default False.
     smooth_cutoff_hz : float
         Butterworth low-pass cutoff (Hz) applied to the centroid trajectories.
         Set to 0 to disable.  Default 2.0 Hz.
@@ -487,21 +481,22 @@ def run_tracklets(
                     f"Consider --tracklet-size {max(max_w, max_h) + 20}."
                 )
 
-    if mask_centroids and results.has_masks:
-        logger.info("Computing mask centre-of-mass centroids...")
-        mask_cent = compute_mask_centroids(
-            results.zarr_root, render_tids, frame_start, frame_end,
-        )
-        replaced = 0
-        for tid, frame_centroids in mask_cent.items():
-            for frame_idx, (cx, cy) in frame_centroids.items():
-                if frame_idx in pos_lookup.get(tid, {}):
-                    row = pos_lookup[tid][frame_idx].copy()
-                    row["pos_x"] = cx
-                    row["pos_y"] = cy
-                    pos_lookup[tid][frame_idx] = row
-                    replaced += 1
-        logger.info(f"Replaced {replaced} centroid(s) with mask CoM")
+    # Override pos_x/pos_y with area-weighted centroids read directly from the
+    # raw CSV tuple-strings.  get_tracking_data() arithmetic-means tuple-valued
+    # rows, which under-weights large segments.  Re-reading and applying the
+    # weighted resolver here gives the correct multi-segment position without
+    # touching the shared yolo_results.py path.
+    weighted_cent = compute_weighted_centroids(predictions_path, render_tids)
+    replaced = 0
+    for tid, frame_centroids in weighted_cent.items():
+        for frame_idx, (cx, cy) in frame_centroids.items():
+            if frame_idx in pos_lookup.get(tid, {}):
+                row = pos_lookup[tid][frame_idx].copy()
+                row["pos_x"] = cx
+                row["pos_y"] = cy
+                pos_lookup[tid][frame_idx] = row
+                replaced += 1
+    logger.debug(f"Applied weighted centroids to {replaced} frame(s)")
 
     if smooth_cutoff_hz and smooth_cutoff_hz > 0:
         butterworth_smooth_tracklet_positions(
@@ -761,7 +756,6 @@ def run_render(
     tracklets=False,
     also_overlay=False,
     tracklet_size=None,
-    tracklet_mask_centroids=False,
     tracklet_smooth_cutoff_hz=2.0,
     tracklet_smooth_order=4,
     tracklet_min_frames=0,
@@ -802,8 +796,6 @@ def run_render(
         When ``tracklets=True``, render the overlay onto the tracklet crops.
     tracklet_size : int
         Side length in pixels of each tracklet crop.  Default 160.
-    tracklet_mask_centroids : bool
-        Use mask CoM instead of bbox centre for tracklet positioning.
     tracklet_smooth_cutoff_hz : float
         Butterworth cutoff (Hz) for centroid smoothing.  0 = off.  Default 2.0.
     tracklet_smooth_order : int
@@ -830,7 +822,6 @@ def run_render(
             preset=preset,
             also_overlay=also_overlay,
             size=tracklet_size,
-            mask_centroids=tracklet_mask_centroids,
             smooth_cutoff_hz=tracklet_smooth_cutoff_hz,
             smooth_order=tracklet_smooth_order,
             alpha=alpha,

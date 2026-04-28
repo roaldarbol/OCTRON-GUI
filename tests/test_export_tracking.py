@@ -11,7 +11,7 @@ column names (pos_x, pos_y, area, …) are kept — no renaming.
 
   pos_x / pos_y : scalar centroid per chosen method
   area          : largest segment's area ("largest") OR sum of all segments
-                  ("weighted" / "mask_com")
+                  ("weighted")
   orientation   : always from the largest segment (circular quantity)
   all other regionprops : resolved by chosen method
 
@@ -57,7 +57,6 @@ _export_tracking_from_data
     other regionprops resolved via chosen method
     combined=False → one file per track
     combined=True  → single all_tracks.csv
-    mask_com with zarr_root=None falls back gracefully
     header metadata preserved in output
 
 export_tracking (public)
@@ -440,13 +439,6 @@ def test_export_combined_contains_all_tracks(tmp_path):
     df = pd.read_csv(tmp_path / "all_tracks.csv", skiprows=7)
     assert set(df["track_id"].unique()) == {0, 1, 2}
 
-def test_export_mask_com_fallback_no_error(tmp_path):
-    _export_tracking_from_data(tmp_path, *_minimal_data(),
-                                method="mask_com", zarr_root=None, combined=False)
-    df = _read_output(tmp_path)
-    assert "pos_x" in df.columns
-    assert not df["pos_x"].isna().all()
-
 def test_export_header_preserved(tmp_path):
     _export_tracking_from_data(tmp_path, *_minimal_data(),
                                 method="largest", zarr_root=None, combined=False)
@@ -734,6 +726,64 @@ def test_raw_parquet_emits_warning(tmp_path, caplog):
     assert any("raw" in rec.message and "parquet" in rec.message
                for rec in caplog.records), \
         "Expected a warning mentioning raw + parquet"
+
+
+# ===========================================================================
+# compute_weighted_centroids
+# ===========================================================================
+
+def test_weighted_centroids_scalar_passthrough(tmp_path):
+    """Scalar pos_x/pos_y in the CSV passes through unchanged."""
+    from octron.tools.export_tracking import compute_weighted_centroids
+    _write_prediction_csv(tmp_path / "animal_track_1.csv", track_id=1, n=3)
+    out = compute_weighted_centroids(tmp_path)
+    assert 1 in out
+    # _write_prediction_csv writes pos_x = arange(n) and pos_y = arange(n)
+    assert out[1][0] == pytest.approx((0.0, 0.0))
+    assert out[1][2] == pytest.approx((2.0, 2.0))
+
+
+def test_weighted_centroids_multi_segment(tmp_path):
+    """Tuple-string rows resolve to area-weighted means."""
+    from octron.tools.export_tracking import compute_weighted_centroids
+    csv_path = tmp_path / "animal_track_1.csv"
+    _write_prediction_csv(csv_path, track_id=1, n=2)
+    df = pd.read_csv(csv_path, skiprows=7)
+    df["pos_x"] = df["pos_x"].astype(object)
+    df["pos_y"] = df["pos_y"].astype(object)
+    df["area"] = df["area"].astype(object)
+    # Frame 0: equal areas → mean is 50, frame 1: 3:1 weight on x=0
+    df.loc[0, "pos_x"] = _tup((0.0, 100.0))
+    df.loc[0, "pos_y"] = _tup((0.0, 100.0))
+    df.loc[0, "area"]  = _tup((50.0, 50.0))
+    df.loc[1, "pos_x"] = _tup((0.0, 100.0))
+    df.loc[1, "pos_y"] = _tup((0.0,   0.0))
+    df.loc[1, "area"]  = _tup((75.0, 25.0))
+    meta = _read_csv_metadata(csv_path)
+    with open(csv_path, "w") as f:
+        f.write(_build_header(meta))
+        df.to_csv(f, index=False, lineterminator="\n")
+
+    out = compute_weighted_centroids(tmp_path)
+    assert out[1][0] == pytest.approx((50.0, 50.0))
+    cx1, cy1 = out[1][1]
+    assert 0.0 < cx1 < 100.0   # weighted between segment positions
+    assert cy1 == pytest.approx(0.0)
+
+
+def test_weighted_centroids_track_id_filter(tmp_path):
+    """Only the requested track_ids appear in the result."""
+    from octron.tools.export_tracking import compute_weighted_centroids
+    _write_prediction_csv(tmp_path / "animal_track_1.csv", track_id=1)
+    _write_prediction_csv(tmp_path / "animal_track_2.csv", track_id=2)
+    out = compute_weighted_centroids(tmp_path, track_ids=[1])
+    assert set(out.keys()) == {1}
+
+
+def test_weighted_centroids_empty_dir(tmp_path):
+    """No CSVs → empty dict, no exception."""
+    from octron.tools.export_tracking import compute_weighted_centroids
+    assert compute_weighted_centroids(tmp_path) == {}
 
 
 # ===========================================================================

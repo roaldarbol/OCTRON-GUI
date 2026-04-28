@@ -21,22 +21,18 @@ largest   : use the value from the single largest segment per frame.  Fully
             numeric output.  Fast, CSV-only, no zarr required.
 weighted  : area-weighted mean across all segments per frame.  Fully numeric.
             ``area`` becomes the *sum* of segment areas.
-mask_com  : ``pos_x``/``pos_y`` replaced by full centre-of-mass from zarr masks
-            (most robust against flickering outlier segments).  All other
-            columns resolved via weighted.  ``area`` is the sum of segment areas.
-            Requires the zarr archive.
 
-Special cases (largest / weighted / mask_com only)
---------------------------------------------------
+Special cases (largest / weighted only)
+---------------------------------------
 area      : ``largest`` → area of the largest segment.
-            ``weighted`` / ``mask_com`` → sum of all segment areas.
+            ``weighted`` → sum of all segment areas.
 orientation : always resolved via ``largest`` (circular quantity; weighted mean
               is undefined for angles).
 
 Public functions
 ----------------
-export_tracking        : Export CSVs from an existing predictions directory.
-compute_mask_centroids : Compute per-frame centre-of-mass from zarr masks.
+export_tracking            : Export CSVs from an existing predictions directory.
+compute_weighted_centroids : Per-frame area-weighted (cx, cy) read from CSVs.
 """
 
 import ast
@@ -47,123 +43,6 @@ from time import perf_counter
 from typing import Literal
 
 import numpy as np
-
-
-# ---------------------------------------------------------------------------
-# Letterbox helper (shared with render.py)
-# ---------------------------------------------------------------------------
-
-def _letterbox_bounds(mask_h, mask_w, vid_h, vid_w):
-    """
-    Compute the video-content region within a mask stored at inference resolution.
-
-    YOLO (retina_masks=False) letterboxes frames to fit within imgsz and then
-    pads to the nearest multiple of stride (32).  The padding is centred, so the
-    actual video content starts at (pad_y, pad_x) within the stored mask.
-
-    Returns
-    -------
-    content_h, content_w : int
-    pad_y, pad_x : int
-    """
-    content_h = round(vid_h * mask_w / vid_w)
-    if content_h <= mask_h:
-        content_w = mask_w
-        pad_y = (mask_h - content_h) // 2
-        pad_x = 0
-    else:
-        content_h = mask_h
-        content_w = round(vid_w * mask_h / vid_h)
-        pad_y = 0
-        pad_x = (mask_w - content_w) // 2
-    return content_h, content_w, pad_y, pad_x
-
-
-# ---------------------------------------------------------------------------
-# compute_mask_centroids (moved from render.py)
-# ---------------------------------------------------------------------------
-
-def compute_mask_centroids(zarr_root, track_ids, frame_start, frame_end, downsample=4):
-    """
-    Compute per-frame centre-of-mass centroids directly from zarr segmentation
-    masks, as a more stable alternative to the bounding-box-derived positions
-    stored in the tracking CSVs.
-
-    Masks are downsampled before computing CoM for speed, then coordinates are
-    scaled back to full resolution.  Processing is vectorised over the batch
-    dimension — no Python loop over frames.
-
-    Parameters
-    ----------
-    zarr_root : zarr.Group
-        Root zarr group from a predictions.zarr archive.
-    track_ids : iterable
-        Track IDs to process (must match the ``{tid}_masks`` array naming).
-    frame_start : int
-        First frame index to process (inclusive).
-    frame_end : int
-        Last frame index to process (exclusive).
-    downsample : int
-        Spatial downscale factor applied before computing CoM.  ``4`` (default)
-        gives 16× fewer pixels with negligible centroid error at full resolution.
-
-    Returns
-    -------
-    centroids : dict
-        ``{track_id: {frame_idx: (cx, cy)}}`` — float pixel coordinates in the
-        original full-resolution frame.  Only frames with at least one mask
-        pixel are included.
-    """
-    _BATCH = 500
-    track_ids = list(track_ids)
-    centroids = {tid: {} for tid in track_ids}
-    n_frames = frame_end - frame_start
-    n_batches_per_track = max(1, (n_frames + _BATCH - 1) // _BATCH)
-    total_batches = len(track_ids) * n_batches_per_track
-    _bar_width = 30
-    batch_idx = 0
-
-    for tid in track_ids:
-        arr_key = f"{tid}_masks"
-        if arr_key not in zarr_root:
-            batch_idx += n_batches_per_track
-            continue
-        zarr_arr = zarr_root[arr_key]
-        n_mask_frames = zarr_arr.shape[0]
-        _mask_h, _mask_w = zarr_arr.shape[1], zarr_arr.shape[2]
-        _vid_h = zarr_arr.attrs.get('video_height', _mask_h) or _mask_h
-        _vid_w = zarr_arr.attrs.get('video_width',  _mask_w) or _mask_w
-        _c_h, _c_w, _p_y, _p_x = _letterbox_bounds(_mask_h, _mask_w, _vid_h, _vid_w)
-
-        for batch_start in range(frame_start, min(frame_end, n_mask_frames), _BATCH):
-            batch_end = min(batch_start + _BATCH, frame_end, n_mask_frames)
-            raw = np.asarray(zarr_arr[batch_start:batch_end])  # (n, H, W)
-
-            mask = (raw[:, ::downsample, ::downsample] == 1)  # (n, dH, dW) bool
-            dH, dW = mask.shape[1], mask.shape[2]
-
-            count = mask.sum(axis=(1, 2))
-            ys = np.arange(dH, dtype=np.float32)[None, :, None]
-            xs = np.arange(dW, dtype=np.float32)[None, None, :]
-            cy_ds = (mask * ys).sum(axis=(1, 2)) / np.maximum(count, 1)
-            cx_ds = (mask * xs).sum(axis=(1, 2)) / np.maximum(count, 1)
-
-            cx_full = (cx_ds * downsample - _p_x) * _vid_w / _c_w
-            cy_full = (cy_ds * downsample - _p_y) * _vid_h / _c_h
-
-            for i, frame_idx in enumerate(range(batch_start, batch_end)):
-                if count[i] > 0:
-                    centroids[tid][frame_idx] = (float(cx_full[i]), float(cy_full[i]))
-
-            batch_idx += 1
-            pct = batch_idx / total_batches
-            filled = int(_bar_width * pct)
-            bar = "█" * filled + "░" * (_bar_width - filled)
-            print(f"  [{bar}] track {tid} | {batch_start}-{batch_end} | {pct:.0%}",
-                  end="\r")
-
-    print()
-    return centroids
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +375,7 @@ def _export_tracking_from_data(
     scalars:
 
     - ``area`` uses the *largest segment's area* for ``"largest"``, and the
-      *sum of all segment areas* for ``"weighted"`` and ``"mask_com"``.
+      *sum of all segment areas* for ``"weighted"``.
     - ``orientation`` always uses the largest segment (circular quantity).
 
     Parameters
@@ -521,9 +400,9 @@ def _export_tracking_from_data(
     video_metadata : dict
         Keys: video_name, frame_count, frame_count_analyzed,
               video_height, video_width, created_at.
-    method : {"raw", "largest", "weighted", "mask_com"}
+    method : {"raw", "largest", "weighted"}
     zarr_root : zarr.Group or None
-        Required only when method == "mask_com".
+        Unused (kept for backwards-compatible call signature).
     combined : bool
         True → single all_tracks.csv; False → one file per track.
     fmt : {"csv", "parquet"}
@@ -542,25 +421,10 @@ def _export_tracking_from_data(
             "method='raw' + fmt='parquet': any column containing tuple-strings "
             "will be stored as a string column (including the scalar values in "
             "single-segment rows), losing numeric type on disk. Use a "
-            "resolution method (largest/weighted/mask_com) for fully numeric "
-            "parquet output."
+            "resolution method (largest/weighted) for fully numeric parquet output."
         )
 
-    # Pre-compute mask centroids once across all tracks when needed
-    mask_centroids_lookup = {}
-    if method == "mask_com" and zarr_root is not None:
-        all_frames = [int(f) for tid in track_ids for f in frame_indices.get(tid, [])]
-        if all_frames:
-            print("Computing mask centroids from zarr...")
-            mask_centroids_lookup = compute_mask_centroids(
-                zarr_root, track_ids,
-                frame_start=min(all_frames),
-                frame_end=max(all_frames) + 1,
-            )
-
-    # Determine per-prop resolver based on method.
-    # mask_com falls back to weighted for all non-centroid metrics.
-    _use_weighted = method in ("weighted", "mask_com")
+    _use_weighted = method == "weighted"
 
     from tqdm import tqdm
 
@@ -583,19 +447,13 @@ def _export_tracking_from_data(
             px, py = sx, sy
         elif method == "weighted":
             px, py = _resolve_xy_weighted(sx, sy, sa)
-        elif method == "mask_com" and mask_centroids_lookup.get(tid):
-            fi_arr = np.asarray(frame_indices[tid])
-            lookup = mask_centroids_lookup[tid]
-            px = np.array([lookup.get(int(f), (np.nan, np.nan))[0] for f in fi_arr])
-            py = np.array([lookup.get(int(f), (np.nan, np.nan))[1] for f in fi_arr])
-        else:
-            # "largest" or mask_com fallback when zarr unavailable
+        else:  # "largest"
             px, py = _resolve_xy_largest(sx, sy, sa)
 
         # --- area ---
         # "raw"      → tuple-strings pass through unchanged.
         # "largest"  → area of the largest segment.
-        # "weighted" / "mask_com" → sum of all segment areas (total mask coverage).
+        # "weighted" → sum of all segment areas (total mask coverage).
         if method == "raw":
             area = sa
         elif _use_weighted:
@@ -877,6 +735,54 @@ def _autodetect_video(predictions_path: Path):
     return None
 
 
+def compute_weighted_centroids(predictions_path, track_ids=None):
+    """
+    Compute per-frame area-weighted centroids by re-reading the raw
+    ``pos_x``/``pos_y``/``area`` columns from per-track prediction CSVs.
+
+    Multi-segment frames (where the columns hold tuple-strings) are reduced
+    to a single (cx, cy) via ``Σ(aᵢ·xᵢ) / Σ(aᵢ)``.  Single-segment scalars
+    pass through unchanged.
+
+    Parameters
+    ----------
+    predictions_path : str or Path
+        Path to an ``octron_predictions/<video>/`` output directory.
+    track_ids : iterable[int] or None
+        If given, only compute centroids for these track IDs.
+
+    Returns
+    -------
+    dict[int, dict[int, tuple[float, float]]]
+        ``{track_id: {frame_idx: (cx, cy)}}``.
+    """
+    import pandas as pd
+    from natsort import natsorted
+
+    predictions_path = Path(predictions_path)
+    csvs = natsorted(predictions_path.glob("*track_*.csv"))
+    if not csvs:
+        return {}
+
+    wanted = set(track_ids) if track_ids is not None else None
+    out = {}
+    for csv_file in csvs:
+        df = pd.read_csv(csv_file, skiprows=_CSV_HEADER_LINES)
+        if df.empty:
+            continue
+        tid = int(df["track_id"].iloc[0])
+        if wanted is not None and tid not in wanted:
+            continue
+        sx = df["pos_x"].to_numpy(dtype=object)
+        sy = df["pos_y"].to_numpy(dtype=object)
+        sa = (df["area"].to_numpy(dtype=object)
+              if "area" in df.columns else np.ones(len(df), dtype=object))
+        cx, cy = _resolve_xy_weighted(sx, sy, sa)
+        fi = df["frame_idx"].to_numpy()
+        out[tid] = {int(fi[i]): (float(cx[i]), float(cy[i])) for i in range(len(fi))}
+    return out
+
+
 def list_region_properties(*, print_output: bool = True) -> dict:
     """Return (and optionally print) all available regionprop names grouped by category.
 
@@ -899,7 +805,7 @@ def list_region_properties(*, print_output: bool = True) -> dict:
 def export_tracking(
     predictions_path,
     output_dir=None,
-    method: Literal["raw", "largest", "weighted", "mask_com"] = "raw",
+    method: Literal["raw", "largest", "weighted"] = "raw",
     region_properties=None,
     video_path=None,
     fmt: Literal["csv", "parquet"] = "csv",
@@ -920,7 +826,7 @@ def export_tracking(
         Path to an ``octron_predictions/<video>/`` output directory.
     output_dir : str or Path or None
         Where to write the output CSVs.  Defaults to *predictions_path*.
-    method : {"raw", "largest", "weighted", "mask_com"}
+    method : {"raw", "largest", "weighted"}
         How to handle multi-segment rows (default: ``"raw"`` — pass through
         tuple-strings unchanged).  See module docstring.
     region_properties : None, "all", "none", "shape", "intensity", or list[str]
@@ -984,7 +890,7 @@ def export_tracking(
         raise FileNotFoundError(f"No tracking CSV files found in {predictions_path}")
     logger.info(f"Found {len(csvs)} tracking CSV(s) in {predictions_path.name}")
 
-    # --- Discover zarr (optional; required only for mask_com) ---
+    # --- Discover zarr (optional; needed only when computing region_properties) ---
     t4 = perf_counter()
     zarr_root = None
     zarr_candidate = predictions_path / "predictions.zarr"
@@ -993,12 +899,6 @@ def export_tracking(
         store = zarr.storage.LocalStore(zarr_candidate, read_only=True)
         zarr_root = zarr.open_group(store=store, mode="r")
         logger.info("Found zarr archive")
-    elif method == "mask_com":
-        logger.warning(
-            "method='mask_com' requested but no zarr archive found — "
-            "falling back to 'largest'."
-        )
-        method = "largest"
 
     # --- Resolve region_properties group aliases ---
     _GROUP_ALIASES = {"shape": "Size and Shape", "intensity": "Intensity"}
