@@ -21,28 +21,37 @@ from typing import List, Optional
 from pathlib import Path
 from enum import Enum
 import typer
+import yaml
 from loguru import logger
 
 
-class YOLOModel(str, Enum):
-    yolo11m = "yolo11m"
-    yolo11l = "yolo11l"
-    yolo26m = "yolo26m"
-    yolo26l = "yolo26l"
+_PKG_DIR = Path(__file__).parent
+
+
+def _enum_from_yaml(name: str, yaml_path: Path, *, available_only: bool = False) -> type:
+    """Build a (str, Enum) from a YAML mapping. Keys are lower-cased for CLI values."""
+    with open(yaml_path) as f:
+        data = yaml.safe_load(f) or {}
+    members = {}
+    for key, info in data.items():
+        if available_only and isinstance(info, dict) and not info.get("available", False):
+            continue
+        value = key.lower()
+        members[value.replace("-", "_")] = value
+    return Enum(name, members, type=str)
+
+
+YOLOModel = _enum_from_yaml(
+    "YOLOModel", _PKG_DIR / "yolo_octron" / "yolo_models.yaml",
+)
+TrackerName = _enum_from_yaml(
+    "TrackerName", _PKG_DIR / "tracking" / "boxmot_trackers.yaml", available_only=True,
+)
 
 
 class TrainMode(str, Enum):
     segment = "segment"
     detect = "detect"
-
-
-class TrackerName(str, Enum):
-    bytetrack = "bytetrack"
-    ocsort = "ocsort"
-    botsort = "botsort"
-    docsort = "d-ocsort"
-    hybridsort = "hybridsort"
-    boosttrack = "boosttrack"
 
 
 class Device(str, Enum):
@@ -171,37 +180,7 @@ def predict(
 ):
     """Run YOLO prediction and tracking on one or more videos."""
     from octron.tools.predict import run_predict
-    from octron.test_gpu import auto_device
 
-    expanded = []
-    for p in videos:
-        if p.is_dir():
-            found = sorted(f for f in p.iterdir() if f.suffix.lower() == ".mp4")
-            if not found:
-                raise typer.BadParameter(f"No .mp4 files found in directory: {p}", param_hint="videos")
-            print(f"Found {len(found)} video(s) in {p}")
-            expanded.extend(found)
-        else:
-            expanded.append(p)
-    videos = expanded
-
-    if model_path.is_dir():
-        candidates = [
-            model_path / "weights" / "best.pt",
-            model_path / "training" / "weights" / "best.pt",
-            model_path / "model" / "training" / "weights" / "best.pt",
-        ]
-        found = next((c for c in candidates if c.exists()), None)
-        if found:
-            model_path = found
-        else:
-            raise typer.BadParameter(
-                f"Directory given but no best.pt found inside: {model_path}",
-                param_hint="'--model'",
-            )
-
-    if device == "auto":
-        device = auto_device()
     if tracker_config is not None:
         tracker_name = None
         tracker_cfg_path = tracker_config
@@ -392,6 +371,10 @@ def render(
         0, "--tracklet-segment-keep",
         help="When --tracklet-segment-only is set, keep only the N largest connected components of the mask. 0 = keep all components (default).",
     ),
+    tracklet_offset: Optional[str] = typer.Option(
+        None, "--tracklet-offset",
+        help="Pixel offset of the tracklet crop centre as 'DX,DY' (e.g. '20,-30'). Positive = right/down. Default: 0,0.",
+    ),
     # --- Filtering ---
     track_ids: Optional[str] = typer.Option(
         None, "--track-ids",
@@ -399,6 +382,10 @@ def render(
     ),
     min_observations: int = typer.Option(
         0, "--min-observations", help="Skip tracks with fewer than this many observations. 0 = keep all tracks.",
+    ),
+    min_confidence: float = typer.Option(
+        0.5, "--min-confidence", min=0.0, max=1.0,
+        help="Skip individual detections whose confidence is below this threshold (0–1). Default 0.5.",
     ),
     trim: bool = typer.Option(
         False, "--trim", help="Trim each tracklet video to the track's first and last observation (within --start/--end if given).",
@@ -441,6 +428,23 @@ def render(
 
     parsed_tracklet_size = None if tracklet_size is None or tracklet_size.lower() == "auto" else int(tracklet_size)
 
+    if tracklet_offset is None or not tracklet_offset.strip():
+        parsed_tracklet_offset = (0, 0)
+    else:
+        try:
+            parts = [int(x.strip()) for x in tracklet_offset.split(",")]
+        except ValueError:
+            raise typer.BadParameter(
+                f"--tracklet-offset must be 'DX,DY' integers (e.g. '20,-30'); got {tracklet_offset!r}.",
+                param_hint="'--tracklet-offset'",
+            )
+        if len(parts) != 2:
+            raise typer.BadParameter(
+                f"--tracklet-offset must be exactly two integers separated by a comma; got {tracklet_offset!r}.",
+                param_hint="'--tracklet-offset'",
+            )
+        parsed_tracklet_offset = (parts[0], parts[1])
+
     run_render(
         predictions_path=predictions_path,
         video_path=video_path,
@@ -460,9 +464,11 @@ def render(
         tracklet_interpolate_max_gap=tracklet_interpolate,
         tracklet_segment_only=tracklet_segment_only,
         tracklet_segment_keep_n=tracklet_segment_keep,
+        tracklet_offset=parsed_tracklet_offset,
         track_ids=parsed_track_ids,
         min_observations=min_observations,
         trim=trim,
+        min_confidence=min_confidence,
         debug=debug,
     )
 

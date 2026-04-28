@@ -22,6 +22,43 @@ PRESETS = {
 }
 
 
+def _validate_render_args(preset, min_confidence, alpha):
+    """Shared input checks for run_render and run_tracklets."""
+    if preset not in PRESETS:
+        raise ValueError(
+            f"preset must be one of {sorted(PRESETS)}; got {preset!r}"
+        )
+    if not 0.0 <= float(min_confidence) <= 1.0:
+        raise ValueError(
+            f"min_confidence must be in [0, 1]; got {min_confidence!r}"
+        )
+    if not 0.0 <= float(alpha) <= 1.0:
+        raise ValueError(
+            f"alpha must be in [0, 1]; got {alpha!r}"
+        )
+
+
+def _coerce_track_ids(track_ids):
+    """Accept None, int, str ('1,3,5'), or iterable of ints; return list[int] or None."""
+    if track_ids is None:
+        return None
+    if isinstance(track_ids, str):
+        try:
+            return [int(x.strip()) for x in track_ids.split(",") if x.strip()]
+        except ValueError as e:
+            raise ValueError(
+                f"track_ids string must be comma-separated ints (e.g. '1,3,5'); got {track_ids!r}"
+            ) from e
+    if isinstance(track_ids, int):
+        return [track_ids]
+    try:
+        return [int(x) for x in track_ids]
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"track_ids must be a list/tuple/str of ints or a single int; got {track_ids!r}"
+        ) from e
+
+
 # ---------------------------------------------------------------------------
 # Encoder helpers
 # ---------------------------------------------------------------------------
@@ -322,6 +359,7 @@ def run_tracklets(
     draw_boxes=False,
     segment_only=False,
     segment_keep_n=0,
+    offset=(0, 0),
     start=None,
     end=None,
     min_track_frames=0,
@@ -329,6 +367,7 @@ def run_tracklets(
     track_ids=None,
     min_observations=0,
     trim=False,
+    min_confidence=0.5,
     debug=False,
 ):
     """
@@ -379,6 +418,16 @@ def run_tracklets(
     end : int, optional
         Last frame index (exclusive).  Default: end of video.
     """
+    _validate_render_args(preset, min_confidence, alpha)
+    track_ids = _coerce_track_ids(track_ids)
+    try:
+        ox, oy = offset
+        offset = (int(ox), int(oy))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"offset must be a (dx, dy) pair of ints; got {offset!r}"
+        ) from e
+
     import cv2
     import numpy as np
     import time
@@ -626,6 +675,9 @@ def run_tracklets(
                 _drew_any = False
                 for tid in render_tids:
                     if tid in _batch_masks:
+                        _conf_row = bbox_lookup.get(tid, {}).get(frame_idx)
+                        if _conf_row is None or _conf_row["confidence"] < min_confidence:
+                            continue
                         batch = _batch_masks[tid]
                         if j < batch.shape[0]:
                             obj = batch[j] == 1
@@ -650,7 +702,7 @@ def run_tracklets(
                 color_bgr = track_colors[tid]
                 if draw_boxes:
                     row = bbox_lookup.get(tid, {}).get(frame_idx)
-                    if row is not None:
+                    if row is not None and row["confidence"] >= min_confidence:
                         x1 = int(row["bbox_x_min"] * scale)
                         y1 = int(row["bbox_y_min"] * scale)
                         x2 = int(row["bbox_x_max"] * scale)
@@ -667,15 +719,18 @@ def run_tracklets(
         for tid in render_tids:
             if trim and not (trim_starts[tid] <= frame_idx < trim_ends[tid]):
                 continue
+            _conf_row = bbox_lookup.get(tid, {}).get(frame_idx)
             row = pos_lookup.get(tid, {}).get(frame_idx)
+            if row is not None and (_conf_row is None or _conf_row["confidence"] < min_confidence):
+                row = None  # below confidence threshold — render as black frame
             if row is not None:
                 if also_overlay and out_frame is not None:
-                    cx = float(row["pos_x"]) * scale
-                    cy = float(row["pos_y"]) * scale
+                    cx = float(row["pos_x"]) * scale + offset[0]
+                    cy = float(row["pos_y"]) * scale + offset[1]
                     crop = cv2.getRectSubPix(out_frame, (size, size), (cx, cy))
                 else:
-                    cx = float(row["pos_x"])
-                    cy = float(row["pos_y"])
+                    cx = float(row["pos_x"]) + offset[0]
+                    cy = float(row["pos_y"]) + offset[1]
                     crop = cv2.getRectSubPix(orig_frame, (size, size), (cx, cy))
 
                 if segment_only:
@@ -762,9 +817,11 @@ def run_render(
     tracklet_interpolate_max_gap=0,
     tracklet_segment_only=False,
     tracklet_segment_keep_n=0,
+    tracklet_offset=(0, 0),
     track_ids=None,
     min_observations=0,
     trim=False,
+    min_confidence=0.5,
     alpha=0.4,
     draw_masks=True,
     draw_boxes=True,
@@ -814,6 +871,9 @@ def run_render(
     end : int, optional
         Last frame index (exclusive).
     """
+    _validate_render_args(preset, min_confidence, alpha)
+    track_ids = _coerce_track_ids(track_ids)
+
     if tracklets:
         run_tracklets(
             predictions_path=predictions_path,
@@ -829,6 +889,7 @@ def run_render(
             draw_boxes=draw_boxes,
             segment_only=tracklet_segment_only,
             segment_keep_n=tracklet_segment_keep_n,
+            offset=tracklet_offset,
             start=start,
             end=end,
             min_track_frames=tracklet_min_frames,
@@ -836,6 +897,7 @@ def run_render(
             track_ids=track_ids,
             min_observations=min_observations,
             trim=trim,
+            min_confidence=min_confidence,
             debug=debug,
         )
         return
@@ -1034,6 +1096,9 @@ def run_render(
             _drew_any = False
             for tid in render_tids:
                 if tid in _batch_masks:
+                    _conf_row = bbox_lookup.get(tid, {}).get(frame_idx)
+                    if _conf_row is None or _conf_row["confidence"] < min_confidence:
+                        continue
                     batch = _batch_masks[tid]
                     if j < batch.shape[0]:
                         obj = batch[j] == 1
@@ -1061,7 +1126,7 @@ def run_render(
 
             if draw_boxes:
                 row = bbox_lookup.get(tid, {}).get(frame_idx)
-                if row is not None:
+                if row is not None and row["confidence"] >= min_confidence:
                     x1 = int(row["bbox_x_min"] * scale)
                     y1 = int(row["bbox_y_min"] * scale)
                     x2 = int(row["bbox_x_max"] * scale)
