@@ -621,6 +621,122 @@ def test_public_export_raises_on_missing_csvs(tmp_path):
 
 
 # ===========================================================================
+# _export_tracking_from_data — method="raw"
+# ===========================================================================
+
+def test_raw_single_segment_pos_passthrough(tmp_path):
+    """Scalar values pass through unchanged."""
+    tids, labels, fc, fi, conf, sx, sy, sa, bbox, rp, meta = _minimal_data(n=4)
+    _export_tracking_from_data(tmp_path, tids, labels, fc, fi, conf, sx, sy, sa,
+                                bbox, rp, meta, method="raw",
+                                zarr_root=None, combined=False)
+    df = _read_output(tmp_path)
+    np.testing.assert_allclose(df["pos_x"].astype(float).values, sx[0].astype(float))
+
+
+def test_raw_multi_segment_pos_x_keeps_tuple_string(tmp_path):
+    """Multi-segment rows keep their tuple-string verbatim."""
+    tids, labels, fc, fi, conf, sx, sy, sa, bbox, rp, meta = _minimal_data(n=1)
+    sx[0] = np.array([_tup((10.0, 90.0))], dtype=object)
+    sy[0] = np.array([_tup(( 5.0, 50.0))], dtype=object)
+    sa[0] = np.array([_tup((50.0, 300.0))], dtype=object)
+    _export_tracking_from_data(tmp_path, tids, labels, fc, fi, conf, sx, sy, sa,
+                                bbox, rp, meta, method="raw",
+                                zarr_root=None, combined=False)
+    df = _read_output(tmp_path)
+    assert df["pos_x"].iloc[0] == _tup((10.0, 90.0))
+    assert df["pos_y"].iloc[0] == _tup(( 5.0, 50.0))
+
+
+def test_raw_area_keeps_tuple_string(tmp_path):
+    """area is NOT summed in raw mode — tuple-string preserved."""
+    tids, labels, fc, fi, conf, sx, sy, sa, bbox, rp, meta = _minimal_data(n=1)
+    sa[0] = np.array([_tup((200.0, 50.0))], dtype=object)
+    sx[0] = np.array([_tup((0.0, 0.0))], dtype=object)
+    sy[0] = np.array([_tup((0.0, 0.0))], dtype=object)
+    _export_tracking_from_data(tmp_path, tids, labels, fc, fi, conf, sx, sy, sa,
+                                bbox, rp, meta, method="raw",
+                                zarr_root=None, combined=False)
+    df = _read_output(tmp_path)
+    assert df["area"].iloc[0] == _tup((200.0, 50.0))
+
+
+def test_raw_orientation_no_special_case(tmp_path):
+    """orientation is NOT forced to 'largest' in raw mode."""
+    tids, labels, fc, fi, conf, sx, sy, sa, bbox, rp, meta = _minimal_data(n=1)
+    sa[0] = np.array([_tup((50.0, 300.0))], dtype=object)
+    sx[0] = np.array([_tup((0.0, 0.0))], dtype=object)
+    sy[0] = np.array([_tup((0.0, 0.0))], dtype=object)
+    rp[0] = {"orientation": np.array([_tup((1.0, 2.0))], dtype=object)}
+    _export_tracking_from_data(tmp_path, tids, labels, fc, fi, conf, sx, sy, sa,
+                                bbox, rp, meta, method="raw",
+                                zarr_root=None, combined=False)
+    df = _read_output(tmp_path)
+    assert df["orientation"].iloc[0] == _tup((1.0, 2.0))
+
+
+def test_raw_regionprops_passthrough(tmp_path):
+    """Mixed scalar + tuple regionprops survive verbatim in raw mode."""
+    tids, labels, fc, fi, conf, sx, sy, sa, bbox, rp, meta = _minimal_data(n=2)
+    sa[0] = np.array([_tup((200.0, 50.0)), 100.0], dtype=object)
+    rp[0] = {"solidity": np.array([_tup((0.9, 0.4)), 0.8], dtype=object)}
+    _export_tracking_from_data(tmp_path, tids, labels, fc, fi, conf, sx, sy, sa,
+                                bbox, rp, meta, method="raw",
+                                zarr_root=None, combined=False)
+    df = _read_output(tmp_path)
+    assert df["solidity"].iloc[0] == _tup((0.9, 0.4))
+    assert float(df["solidity"].iloc[1]) == pytest.approx(0.8)
+
+
+def test_raw_is_default_method_for_public_api(tmp_path):
+    """export_tracking() with no method= argument should preserve tuple-strings."""
+    csv_path = tmp_path / "animal_track_1.csv"
+    _write_prediction_csv(csv_path, track_id=1, n=2)
+    df = pd.read_csv(csv_path, skiprows=7)
+    df["pos_x"] = df["pos_x"].astype(object)
+    df["area"] = df["area"].astype(object)
+    df.loc[0, "pos_x"] = _tup((10.0, 90.0))
+    df.loc[0, "area"] = _tup((50.0, 300.0))
+    meta = _read_csv_metadata(csv_path)
+    from octron.tools.export_tracking import _build_header
+    with open(csv_path, "w") as f:
+        f.write(_build_header(meta))
+        df.to_csv(f, index=False, lineterminator="\n")
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    export_tracking(tmp_path, output_dir=out_dir)  # no method= → defaults to raw
+    out = pd.read_csv(out_dir / "animal_track_1.csv", skiprows=7)
+    assert out["pos_x"].iloc[0] == _tup((10.0, 90.0))
+    assert out["area"].iloc[0] == _tup((50.0, 300.0))
+
+
+def test_raw_parquet_emits_warning(tmp_path, caplog):
+    """method='raw' + fmt='parquet' should warn about string-typed columns."""
+    pytest.importorskip("pyarrow")
+    import logging
+    from loguru import logger as _logger
+
+    # Loguru → stdlib logging bridge so caplog captures the warning
+    class _PropagateHandler(logging.Handler):
+        def emit(self, record):
+            logging.getLogger(record.name).handle(record)
+
+    handler_id = _logger.add(_PropagateHandler(), format="{message}", level="WARNING")
+    try:
+        with caplog.at_level("WARNING"):
+            _export_tracking_from_data(tmp_path, *_minimal_data(),
+                                        method="raw", zarr_root=None,
+                                        combined=False, fmt="parquet")
+    finally:
+        _logger.remove(handler_id)
+
+    assert any("raw" in rec.message and "parquet" in rec.message
+               for rec in caplog.records), \
+        "Expected a warning mentioning raw + parquet"
+
+
+# ===========================================================================
 # export_tracking — overwrite guard
 # ===========================================================================
 

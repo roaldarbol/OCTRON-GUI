@@ -2,27 +2,32 @@
 OCTRON tracking export pipeline.
 
 Converts zarr mask archives and per-track CSVs produced by ``octron predict``
-into clean, analysis-ready CSV files with resolved scalar columns.
+into analysis-ready CSV (or parquet) files.
 
-All columns that contain tuple-strings (produced when multiple disconnected
-segments are detected in a single frame) are resolved to scalars using the
-chosen ``method``.  The same strategy applies to every column —
-positions, areas, shape descriptors, and intensity properties — so the output
-is always fully numeric.
+When multiple disconnected segments are detected in a single frame, every
+per-segment column (positions, areas, shape descriptors, intensity properties)
+is stored as a tuple-string — e.g. ``"(120.5, 85.3)"``.  The ``method``
+parameter controls how those tuple-valued rows are handled at export time.
 
-Centroid / resolution methods
-------------------------------
-largest   : use the value from the single largest segment per frame (default).
-            Fast, CSV-only, no zarr required.
-weighted  : area-weighted mean across all segments per frame.
-            CSV-only.  ``area`` becomes the *sum* of segment areas.
+Resolution methods
+------------------
+raw       : default.  Tuple-strings pass through unchanged; single-segment
+            rows stay scalar.  Matches the original predict output (no info
+            loss).  CSV columns end up as ``object`` dtype on read.  When
+            writing parquet, mixed columns are stored as strings — including
+            the scalar values — which loses numeric typing on disk; a warning
+            is emitted in that case.
+largest   : use the value from the single largest segment per frame.  Fully
+            numeric output.  Fast, CSV-only, no zarr required.
+weighted  : area-weighted mean across all segments per frame.  Fully numeric.
+            ``area`` becomes the *sum* of segment areas.
 mask_com  : ``pos_x``/``pos_y`` replaced by full centre-of-mass from zarr masks
             (most robust against flickering outlier segments).  All other
             columns resolved via weighted.  ``area`` is the sum of segment areas.
             Requires the zarr archive.
 
-Special cases
--------------
+Special cases (largest / weighted / mask_com only)
+--------------------------------------------------
 area      : ``largest`` → area of the largest segment.
             ``weighted`` / ``mask_com`` → sum of all segment areas.
 orientation : always resolved via ``largest`` (circular quantity; weighted mean
@@ -475,7 +480,7 @@ def _export_tracking_from_data(
     bbox,
     region_props,
     video_metadata,
-    method="largest",
+    method="raw",
     zarr_root=None,
     combined=False,
     fmt="csv",
@@ -486,10 +491,9 @@ def _export_tracking_from_data(
     This is the single place where prediction CSVs are written — called by
     both ``predict_batch`` (in-memory path) and ``export_tracking`` (disk path).
 
-    All tuple-valued columns (produced when multiple disconnected segments are
-    detected in a frame) are resolved to scalars using ``method``.
-    The same strategy applies to positions, areas, and all regionprops columns,
-    with two exceptions:
+    Method ``"raw"`` (default) preserves multi-segment values as tuple-strings,
+    matching the original predict output.  The other methods resolve tuples to
+    scalars:
 
     - ``area`` uses the *largest segment's area* for ``"largest"``, and the
       *sum of all segment areas* for ``"weighted"`` and ``"mask_com"``.
@@ -517,19 +521,30 @@ def _export_tracking_from_data(
     video_metadata : dict
         Keys: video_name, frame_count, frame_count_analyzed,
               video_height, video_width, created_at.
-    method : {"largest", "weighted", "mask_com"}
+    method : {"raw", "largest", "weighted", "mask_com"}
     zarr_root : zarr.Group or None
         Required only when method == "mask_com".
     combined : bool
         True → single all_tracks.csv; False → one file per track.
     fmt : {"csv", "parquet"}
         Output format.  Parquet stores video metadata in the file schema.
+        ``method="raw"`` + ``fmt="parquet"`` produces string-typed columns
+        for any field that contains tuple-strings; a warning is emitted.
     """
     import pandas as pd
     from loguru import logger
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if method == "raw" and fmt == "parquet":
+        logger.warning(
+            "method='raw' + fmt='parquet': any column containing tuple-strings "
+            "will be stored as a string column (including the scalar values in "
+            "single-segment rows), losing numeric type on disk. Use a "
+            "resolution method (largest/weighted/mask_com) for fully numeric "
+            "parquet output."
+        )
 
     # Pre-compute mask centroids once across all tracks when needed
     mask_centroids_lookup = {}
@@ -564,7 +579,9 @@ def _export_tracking_from_data(
         sa = np.asarray(segments_area.get(tid, np.ones(n)), dtype=object)
 
         # --- pos_x / pos_y ---
-        if method == "weighted":
+        if method == "raw":
+            px, py = sx, sy
+        elif method == "weighted":
             px, py = _resolve_xy_weighted(sx, sy, sa)
         elif method == "mask_com" and mask_centroids_lookup.get(tid):
             fi_arr = np.asarray(frame_indices[tid])
@@ -576,9 +593,12 @@ def _export_tracking_from_data(
             px, py = _resolve_xy_largest(sx, sy, sa)
 
         # --- area ---
-        # "largest" → area of the largest segment.
+        # "raw"      → tuple-strings pass through unchanged.
+        # "largest"  → area of the largest segment.
         # "weighted" / "mask_com" → sum of all segment areas (total mask coverage).
-        if _use_weighted:
+        if method == "raw":
+            area = sa
+        elif _use_weighted:
             area = _sum_segments_area(sa)
         else:
             area = _resolve_prop_largest(sa, sa)
@@ -590,8 +610,10 @@ def _export_tracking_from_data(
             prop_items, desc=f"  resolving props", unit="prop", leave=False,
         ):
             pv = np.asarray(prop_values, dtype=object)
-            # orientation is a circular quantity — always use largest segment.
-            if prop_name == "orientation" or not _use_weighted:
+            if method == "raw":
+                resolved_props[prop_name] = pv
+            elif prop_name == "orientation" or not _use_weighted:
+                # orientation is a circular quantity — always use largest segment.
                 resolved_props[prop_name] = _resolve_prop_largest(pv, sa)
             else:
                 resolved_props[prop_name] = _resolve_prop_weighted(pv, sa)
@@ -877,7 +899,7 @@ def list_region_properties(*, print_output: bool = True) -> dict:
 def export_tracking(
     predictions_path,
     output_dir=None,
-    method: Literal["largest", "weighted", "mask_com"] = "largest",
+    method: Literal["raw", "largest", "weighted", "mask_com"] = "raw",
     region_properties=None,
     video_path=None,
     fmt: Literal["csv", "parquet"] = "csv",
@@ -888,8 +910,9 @@ def export_tracking(
     Export tracking CSVs from an existing OCTRON predictions directory.
 
     Reads the per-track CSVs and (optionally) zarr masks produced by
-    ``octron predict``, resolves all tuple-valued columns to scalars using
-    the chosen strategy, and writes new CSVs.
+    ``octron predict`` and writes new CSVs.  By default (``method="raw"``)
+    multi-segment values pass through as tuple-strings; the other methods
+    resolve those to scalars.
 
     Parameters
     ----------
@@ -897,9 +920,9 @@ def export_tracking(
         Path to an ``octron_predictions/<video>/`` output directory.
     output_dir : str or Path or None
         Where to write the output CSVs.  Defaults to *predictions_path*.
-    method : {"largest", "weighted", "mask_com"}
-        How to resolve multi-segment rows.  Applied consistently to all
-        columns (positions, areas, regionprops).  See module docstring.
+    method : {"raw", "largest", "weighted", "mask_com"}
+        How to handle multi-segment rows (default: ``"raw"`` — pass through
+        tuple-strings unchanged).  See module docstring.
     region_properties : None, "all", "none", "shape", "intensity", or list[str]
         Which regionprop columns to include in the output.
 

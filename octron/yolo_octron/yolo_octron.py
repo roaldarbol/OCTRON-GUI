@@ -2441,7 +2441,7 @@ class YOLO_octron:
                 bbox=_export_bbox,
                 region_props=_export_region_props,
                 video_metadata=_export_video_meta,
-                method="largest",
+                method="raw",
                 zarr_root=None,
                 combined=False,
             )

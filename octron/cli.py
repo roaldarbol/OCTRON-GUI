@@ -229,6 +229,7 @@ def predict(
 
 
 class Method(str, Enum):
+    raw      = "raw"
     largest  = "largest"
     weighted = "weighted"
     mask_com = "mask_com"
@@ -257,10 +258,12 @@ def export(
         help="Where to write the output CSV(s). Defaults to the predictions directory.",
     ),
     method: Method = typer.Option(
-        Method.largest, "--method",
+        Method.raw, "--method",
         help=(
-            "How to resolve multi-segment frames. "
-            "'largest': use values from the single largest segment (default). "
+            "How to handle multi-segment frames. "
+            "'raw': keep tuple-strings unchanged (default; matches the original "
+            "predict output, no info loss). "
+            "'largest': use values from the single largest segment. "
             "'weighted': area-weighted mean across all segments. "
             "'mask_com': centre-of-mass from zarr masks for pos_x/y (most robust)."
         ),
