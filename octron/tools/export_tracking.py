@@ -109,7 +109,55 @@ _POSITION_PROPS = frozenset({"centroid", "weighted_centroid"})
 _AXIS_LABELS = ("y", "x")
 _CHANNEL_LABELS = ("r", "g", "b", "lum")
 
-_PROPS_BATCH = 500  # zarr frames per contiguous read when computing props
+_PROPS_BATCH = 500       # CPU: zarr frames per contiguous read when computing props
+_PROPS_BATCH_GPU = 2000  # GPU: larger batches amortise per-call kernel-launch overhead
+
+# Properties that pyclesperanto's statistics_of_labelled_pixels can produce
+# directly (or that we derive cheaply from those primitives in numpy on host).
+# Anything outside this set falls back to skimage on host using the SAME
+# labelled image — no double labelling.
+_OPENCL_NATIVE = frozenset({
+    "area",  # not user-facing (already in _BASE_COLS) but needed as scratch
+    "intensity_max", "intensity_mean", "intensity_min", "intensity_std",
+    "weighted_centroid",
+    "equivalent_diameter_area",  # = 2·sqrt(area/π), derived in numpy
+    "extent",                    # = area / (bbox_w·bbox_h), derived in numpy
+})
+
+
+def _pyclesperanto_available() -> bool:
+    """True when pyclesperanto + a usable device (any backend) are visible."""
+    try:
+        import pyclesperanto as _cle
+        return bool(_cle.list_available_devices())
+    except Exception:
+        return False
+
+
+def _resolve_device(device: str) -> str:
+    """Reduce 'auto'/'cpu'/'cuda'/'mps' to either 'opencl' (pyclesperanto path) or 'cpu'.
+
+    The CLI accepts 'cuda' for cross-subcommand consistency with `train` /
+    `predict`; the GPU regionprops path itself is OpenCL via pyclesperanto.
+    """
+    from loguru import logger as _log
+
+    d = (device or "auto").lower()
+    if d in ("cuda", "opencl"):
+        if not _pyclesperanto_available():
+            raise RuntimeError(
+                f"device='{d}' requested but pyclesperanto is not available "
+                f"or no device is visible. Install with `uv pip install pyclesperanto`."
+            )
+        return "opencl"
+    if d == "auto":
+        return "opencl" if _pyclesperanto_available() else "cpu"
+    if d == "mps":
+        _log.warning(
+            "device='mps' has no GPU regionprops backend; falling back to CPU."
+        )
+        return "cpu"
+    return "cpu"
 
 
 def _rename_prop_column(col_key, has_intensity):
@@ -177,6 +225,70 @@ def _rename_prop_column(col_key, has_intensity):
 
     # Default: keep multi-value expansions like moments_hu-0..6 unchanged.
     return col_key
+
+
+def _postprocess_region_props(props, computable, wanted_spread, n_channels,
+                               r0, c0, has_intensity):
+    """Convert raw regionprops_table output (dict of host-side numpy arrays)
+    into a per-frame {col_name: value} dict applying the OCTRON column contract.
+
+    Steps:
+      1. Derive weighted_var_y/x and weighted_cov_yx from weighted_moments_central
+         (only when those pseudo-props were requested).
+      2. Shift translation-variant columns (centroid, weighted_centroid) from
+         cropped-bbox coordinates back into full-frame coordinates by adding
+         (r0, c0).
+      3. Drop columns the caller didn't request.
+      4. Rename skimage's '-N' suffixes to readable labels via _rename_prop_column.
+      5. Format single-region values as floats and multi-region values as
+         tuple-strings (matching the legacy column contract).
+
+    Both the CPU (skimage) and GPU (pyclesperanto + skimage) workers call
+    this once per frame.
+    """
+    import numpy as _np
+
+    if wanted_spread and n_channels > 0:
+        for ch in range(n_channels):
+            m00 = props.get(f"weighted_moments_central-0-0-{ch}")
+            if m00 is None:
+                continue
+            for (i, j), base in _SPREAD_FROM_MOMENT.items():
+                if base not in wanted_spread:
+                    continue
+                m_ij = props.get(f"weighted_moments_central-{i}-{j}-{ch}")
+                if m_ij is None:
+                    continue
+                with _np.errstate(divide="ignore", invalid="ignore"):
+                    derived = _np.where(m00 != 0, m_ij / m00, _np.nan)
+                props[f"{base}-{ch}"] = derived
+
+    for col_key, vals in list(props.items()):
+        base = col_key.split("-")[0]
+        if base not in _TRANSLATION_VARIANT_PROPS:
+            continue
+        parts = col_key.split("-")
+        if len(parts) < 2:
+            continue
+        try:
+            ax_idx = int(parts[1])
+        except ValueError:
+            continue
+        offset = r0 if ax_idx == 0 else c0 if ax_idx == 1 else 0
+        if offset:
+            props[col_key] = vals + offset
+
+    frame_result = {}
+    for col_key, vals in props.items():
+        base = col_key.split("-")[0]
+        if base not in computable and col_key not in computable:
+            continue
+        out_key = _rename_prop_column(col_key, has_intensity)
+        frame_result[out_key] = (
+            float(vals[0]) if len(vals) == 1
+            else str(tuple(float(v) for v in vals))
+        )
+    return frame_result
 
 
 def _zarr_batch_worker(args):
@@ -270,62 +382,170 @@ def _zarr_batch_worker(args):
         t_label += td - tc
         t_props += te - td
 
-        # Derive intensity-weighted spread columns from weighted_moments_central:
-        #   weighted_var_y_{ch}  = μ_20 / μ_00   (variance along y, per channel)
-        #   weighted_var_x_{ch}  = μ_02 / μ_00
-        #   weighted_cov_yx_{ch} = μ_11 / μ_00
-        # Stored under pseudo-prop names with a single channel suffix so the
-        # downstream rename helper produces e.g. weighted_var_y_r.
-        if wanted_spread and intensity_crop is not None:
-            n_channels = intensity_crop.shape[2] if intensity_crop.ndim == 3 else 1
+        n_channels = intensity_crop.shape[2] if intensity_crop is not None else 0
+        frame_result = _postprocess_region_props(
+            props, computable, wanted_spread, n_channels,
+            r0=r0, c0=c0, has_intensity=intensity_crop is not None,
+        )
+        if frame_result:
+            results[pos] = frame_result
+
+    if cap is not None:
+        cap.release()
+
+    return results, fi_lo, fi_hi, t1 - t0, _pc() - t1, t_binary, t_bbox, t_label, t_props
+
+
+def _zarr_batch_worker_opencl(args):
+    """In-process pyclesperanto/OpenCL worker — same args/returns as the CPU
+    worker.
+
+    Routes connected-components labelling and intensity statistics through the
+    GPU; falls back to skimage on host (against the SAME labelled image, no
+    double work) for any property pyclesperanto doesn't expose — e.g.
+    eccentricity, perimeter, moments_hu, weighted_moments_central (the basis
+    for our weighted_var/cov spread features).
+
+    Must be called serially from the main process.  ProcessPoolExecutor on
+    top of one OpenCL context per child process is a footgun.
+    """
+    zarr_store_path, arr_key, batch_fi, fi_positions, computable, video_path, mask_h, mask_w = args
+    import zarr as _zarr
+    import numpy as _np
+    import pyclesperanto as _cle
+    from skimage import measure as _measure
+    from time import perf_counter as _pc
+    from pathlib import Path as _Path
+
+    # Partition computable into GPU-handled vs CPU-handled.
+    cpu_residual = [p for p in computable if p not in _OPENCL_NATIVE]
+    wanted_spread = [p for p in cpu_residual if p in _WEIGHTED_SPREAD_PROPS]
+    cpu_sk_properties = [p for p in cpu_residual if p not in _WEIGHTED_SPREAD_PROPS]
+    if wanted_spread and "weighted_moments_central" not in cpu_sk_properties:
+        cpu_sk_properties.append("weighted_moments_central")
+
+    store = _zarr.storage.LocalStore(_Path(zarr_store_path), read_only=True)
+    root = _zarr.open_group(store=store, mode="r")
+    zarr_arr = root[arr_key]
+
+    fi_lo, fi_hi = batch_fi[0], batch_fi[-1]
+    t0 = _pc()
+    raw_batch = _np.asarray(zarr_arr[fi_lo : fi_hi + 1])
+    t1 = _pc()
+
+    cap = None
+    current_video_pos = -1
+    if video_path is not None:
+        import cv2 as _cv2
+        cap = _cv2.VideoCapture(video_path)
+
+    results = {}
+    t_binary = t_bbox = t_label = t_props = 0.0
+    for fi, pos in zip(batch_fi, fi_positions):
+        raw = raw_batch[fi - fi_lo]
+
+        ta = _pc()
+        binary = raw == 1
+        tb = _pc()
+        rows_any = binary.any(axis=1)
+        if not rows_any.any():
+            t_binary += tb - ta
+            t_bbox += _pc() - tb
+            continue
+        cols_any = binary.any(axis=0)
+        r0 = int(rows_any.argmax())
+        r1 = int(len(rows_any) - rows_any[::-1].argmax())
+        c0 = int(cols_any.argmax())
+        c1 = int(len(cols_any) - cols_any[::-1].argmax())
+        tc = _pc()
+
+        intensity_crop = None
+        if cap is not None:
+            if fi != current_video_pos:
+                cap.set(_cv2.CAP_PROP_POS_FRAMES, fi)
+            ok, frame = cap.read()
+            current_video_pos = fi + 1 if ok else -1
+            if ok:
+                fh, fw = frame.shape[:2]
+                if fh != mask_h or fw != mask_w:
+                    frame = _cv2.resize(frame, (mask_w, mask_h), interpolation=_cv2.INTER_LINEAR)
+                rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
+                lum = _cv2.cvtColor(frame, _cv2.COLOR_BGR2GRAY)
+                intensity_crop = _np.dstack([rgb, lum])[r0:r1, c0:c1]
+
+        # GPU: connected-components on the cropped binary mask.
+        binary_crop = binary[r0:r1, c0:c1].astype(_np.uint8)
+        bin_d = _cle.push(binary_crop)
+        labeled_d = _cle.connected_components_labeling(bin_d, connectivity="box")
+        td = _pc()
+
+        props = {}
+        n_channels = intensity_crop.shape[2] if intensity_crop is not None else 0
+
+        # GPU: per-channel statistics.  Geometry fields are channel-invariant
+        # so we only keep them from the first call.
+        bbox_w = bbox_h = None
+        if intensity_crop is not None and n_channels > 0:
             for ch in range(n_channels):
-                m00 = props.get(f"weighted_moments_central-0-0-{ch}")
-                if m00 is None:
-                    continue
-                for (i, j), base in _SPREAD_FROM_MOMENT.items():
-                    if base not in wanted_spread:
-                        continue
-                    m_ij = props.get(f"weighted_moments_central-{i}-{j}-{ch}")
-                    if m_ij is None:
-                        continue
-                    with _np.errstate(divide="ignore", invalid="ignore"):
-                        derived = _np.where(m00 != 0, m_ij / m00, _np.nan)
-                    props[f"{base}-{ch}"] = derived
+                ch_d = _cle.push(intensity_crop[:, :, ch].astype(_np.float32))
+                stats = _cle.statistics_of_labelled_pixels(
+                    intensity=ch_d, label=labeled_d
+                )
+                if ch == 0:
+                    props["area"] = _np.asarray(stats["area"])
+                    bbox_w = _np.asarray(stats["bbox_width"])
+                    bbox_h = _np.asarray(stats["bbox_height"])
+                # Always populate; the post-process filter drops what wasn't
+                # requested.
+                props[f"intensity_mean-{ch}"] = _np.asarray(stats["mean_intensity"])
+                props[f"intensity_min-{ch}"]  = _np.asarray(stats["min_intensity"])
+                props[f"intensity_max-{ch}"]  = _np.asarray(stats["max_intensity"])
+                props[f"intensity_std-{ch}"]  = _np.asarray(stats["standard_deviation_intensity"])
+                # mass_center_x/y in cropped-image coords; bbox-offset added
+                # back to full-frame in the post-process step.
+                props[f"weighted_centroid-0-{ch}"] = _np.asarray(stats["mass_center_y"])
+                props[f"weighted_centroid-1-{ch}"] = _np.asarray(stats["mass_center_x"])
+        else:
+            stats = _cle.statistics_of_labelled_pixels(intensity=None, label=labeled_d)
+            props["area"] = _np.asarray(stats["area"])
+            bbox_w = _np.asarray(stats["bbox_width"])
+            bbox_h = _np.asarray(stats["bbox_height"])
 
-        # Crop-then-compute is correct only for translation-invariant
-        # properties.  For variant ones (centroid, weighted_centroid)
-        # we shift each spatial axis back into full-frame coordinates.
-        # Skimage names the spatial axis as the FIRST numeric suffix:
-        #   centroid-0          → axis 0 (y) → add r0
-        #   centroid-1          → axis 1 (x) → add c0
-        #   weighted_centroid-0-{ch}  → axis 0 (y) → add r0
-        #   weighted_centroid-1-{ch}  → axis 1 (x) → add c0
-        for col_key, vals in props.items():
-            base = col_key.split("-")[0]
-            if base not in _TRANSLATION_VARIANT_PROPS:
-                continue
-            parts = col_key.split("-")
-            if len(parts) < 2:
-                continue
-            try:
-                ax_idx = int(parts[1])
-            except ValueError:
-                continue
-            offset = r0 if ax_idx == 0 else c0 if ax_idx == 1 else 0
-            if offset:
-                props[col_key] = vals + offset
+        # Cheap derived fields (translation-invariant; no offset correction).
+        if "equivalent_diameter_area" in computable:
+            with _np.errstate(invalid="ignore"):
+                props["equivalent_diameter_area"] = 2.0 * _np.sqrt(props["area"] / _np.pi)
+        if "extent" in computable:
+            with _np.errstate(divide="ignore", invalid="ignore"):
+                bbox_area = bbox_w * bbox_h
+                props["extent"] = _np.where(
+                    bbox_area != 0, props["area"] / bbox_area, _np.nan
+                )
 
-        frame_result = {}
-        has_intensity = intensity_crop is not None
-        for col_key, vals in props.items():
-            base = col_key.split("-")[0]
-            if base not in computable and col_key not in computable:
-                continue
-            out_key = _rename_prop_column(col_key, has_intensity)
-            frame_result[out_key] = (
-                float(vals[0]) if len(vals) == 1
-                else str(tuple(float(v) for v in vals))
-            )
+        te = _pc()
+
+        # CPU fallback for properties pyclesperanto doesn't expose.  Reuse
+        # the SAME labelled image (pulled to host once) so we don't pay the
+        # connected-components cost twice.
+        if cpu_sk_properties:
+            labeled_host = _cle.pull(labeled_d).astype(_np.int32)
+            with _np.errstate(divide="ignore", invalid="ignore"):
+                cpu_props = _measure.regionprops_table(
+                    labeled_host,
+                    intensity_image=intensity_crop,
+                    properties=cpu_sk_properties,
+                )
+            props.update(cpu_props)
+
+        t_binary += tb - ta
+        t_bbox += tc - tb
+        t_label += td - tc
+        t_props += te - td
+
+        frame_result = _postprocess_region_props(
+            props, computable, wanted_spread, n_channels,
+            r0=r0, c0=c0, has_intensity=intensity_crop is not None,
+        )
         if frame_result:
             results[pos] = frame_result
 
@@ -762,7 +982,7 @@ _BASE_COLS = frozenset({"frame_counter", "frame_idx", "track_id", "label",
 
 
 def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, properties,
-                                   zarr_path=None, video_path=None):
+                                   zarr_path=None, video_path=None, device="cpu"):
     """
     Compute per-frame regionprops directly from zarr segmentation masks.
 
@@ -783,6 +1003,12 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
         Path to the original video file.  Required to compute intensity
         properties (intensity_mean, intensity_max, intensity_min,
         intensity_std).  Frames are resized to mask resolution if needed.
+    device : {"auto", "cpu", "cuda", "mps"}
+        ``"auto"`` (default) picks the pyclesperanto/OpenCL GPU path when a
+        device is visible, else CPU.  ``"cuda"`` is a hard request for the
+        GPU path (kept for naming consistency with `train` / `predict`; the
+        backend itself is OpenCL).  ``"mps"`` has no GPU regionprops backend
+        and silently falls back to CPU.
 
     Returns
     -------
@@ -791,7 +1017,6 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
         Multi-segment frames are encoded as tuple-strings ``"(v1, v2, ...)"``.
         Empty-mask frames are ``NaN``.
     """
-    from skimage import measure
     from tqdm import tqdm
     from loguru import logger as _log
 
@@ -812,15 +1037,31 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
     import os
     from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-    n_workers = min(8, os.cpu_count() or 4)
-    # ProcessPoolExecutor bypasses the GIL for true CPU parallelism.
-    # Falls back to threads only if the zarr path is unavailable.
-    use_processes = zarr_path is not None
-    ExecutorClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
-    _log.debug(
-        f"Using {'ProcessPoolExecutor' if use_processes else 'ThreadPoolExecutor'} "
-        f"with {n_workers} workers"
-    )
+    resolved_device = _resolve_device(device)
+    on_gpu = resolved_device == "opencl"
+    if on_gpu:
+        gpu_native = _OPENCL_NATIVE & set(computable)
+        cpu_residual = sorted(set(computable) - _OPENCL_NATIVE)
+        _log.info(
+            f"Using pyclesperanto (OpenCL GPU) for regionprops. "
+            f"GPU-native: {sorted(gpu_native) or '[]'}; "
+            f"CPU fallback: {cpu_residual or '[]'}."
+        )
+        worker_fn = _zarr_batch_worker_opencl
+        batch_size = _PROPS_BATCH_GPU
+        n_workers = 1  # serial, in-process
+    else:
+        n_workers = min(8, os.cpu_count() or 4)
+        # ProcessPoolExecutor bypasses the GIL for true CPU parallelism.
+        # Falls back to threads only if the zarr path is unavailable.
+        use_processes = zarr_path is not None
+        ExecutorClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+        _log.debug(
+            f"Using {'ProcessPoolExecutor' if use_processes else 'ThreadPoolExecutor'} "
+            f"with {n_workers} workers"
+        )
+        worker_fn = _zarr_batch_worker
+        batch_size = _PROPS_BATCH
 
     result = {}
 
@@ -845,25 +1086,25 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
 
         _video_path_str = str(video_path) if video_path is not None else None
 
-        # Build picklable args for the module-level worker function.
+        # Build picklable args for the worker function.
         # Each entry contains everything the worker needs independently.
         batch_args = [
             (
                 str(zarr_path),
                 arr_key,
-                valid_fi[s : s + _PROPS_BATCH],
-                [fi_to_pos[fi] for fi in valid_fi[s : s + _PROPS_BATCH]],
+                valid_fi[s : s + batch_size],
+                [fi_to_pos[fi] for fi in valid_fi[s : s + batch_size]],
                 computable,
                 _video_path_str,
                 mask_h,
                 mask_w,
             )
-            for s in range(0, len(valid_fi), _PROPS_BATCH)
+            for s in range(0, len(valid_fi), batch_size)
         ]
 
-        with ExecutorClass(max_workers=n_workers) as executor:
+        def _consume_batch_results(batch_iter):
             for batch_results, fi_lo, fi_hi, t_io, t_cpu, t_bin, t_bbox, t_lbl, t_rpt in tqdm(
-                executor.map(_zarr_batch_worker, batch_args),
+                batch_iter,
                 total=len(batch_args),
                 desc=f"  track {tid}", unit="batch", leave=False,
             ):
@@ -875,6 +1116,15 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
                 )
                 for pos, frame_result in batch_results.items():
                     rows[pos].update(frame_result)
+
+        if on_gpu:
+            # Serial dispatch — one OpenCL context, large batches amortise
+            # kernel-launch overhead.  ProcessPoolExecutor on top of a single
+            # GPU context is the well-known footgun this path avoids.
+            _consume_batch_results(map(worker_fn, batch_args))
+        else:
+            with ExecutorClass(max_workers=n_workers) as executor:
+                _consume_batch_results(executor.map(worker_fn, batch_args))
 
         # Collect all column names that actually appeared (handles expansion)
         all_keys = set()
@@ -1022,6 +1272,7 @@ def export_tracking(
     fmt: Literal["csv", "parquet"] = "csv",
     combined=False,
     overwrite=False,
+    device: Literal["auto", "cpu", "cuda", "mps"] = "cpu",
 ):
     """
     Export tracking CSVs from an existing OCTRON predictions directory.
@@ -1077,6 +1328,13 @@ def export_tracking(
     overwrite : bool
         If False (default) raise FileExistsError when any output file already
         exists.  Set True to silently overwrite.
+    device : {"auto", "cpu", "cuda", "mps"}
+        Compute backend for the regionprops step.  ``"auto"`` (default) uses
+        the pyclesperanto/OpenCL GPU path when a device is visible, else CPU.
+        ``"cuda"`` is a hard request for the GPU path (kept for naming
+        consistency with `train` / `predict`; the backend itself is OpenCL,
+        which works on NVIDIA, AMD, and Intel GPUs).  ``"mps"`` is unsupported
+        and falls back to CPU.
     """
     t0 = perf_counter()
     from loguru import logger
@@ -1195,6 +1453,7 @@ def export_tracking(
                 zarr_root, track_ids, frame_indices, props_to_compute,
                 zarr_path=zarr_candidate,
                 video_path=video_path,
+                device=device,
             )
             logger.debug(f"zarr regionprops: {perf_counter()-t_zarr:.3f}s")
             for tid in track_ids:

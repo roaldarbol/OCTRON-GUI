@@ -61,6 +61,10 @@ dependencies = [
 pyqt5 = ["PyQt5>=5.15.11"]
 pyqt6 = ["PyQt6>=6.10.0"]
 all = ["napari[pyqt6]==0.7.0"]
+# Optional GPU acceleration for the regionprops step in `octron export`.
+# Cross-platform (Windows, Linux, macOS); on NVIDIA the OpenCL ICD bundled
+# with the driver is sufficient, no CUDA toolkit needed.
+gpu = ["pyclesperanto>=0.22.0"]
 dev = [
     "pytest>=7.0",
     "pytest-cov",

@@ -1130,3 +1130,138 @@ def test_translation_variant_set_classification():
     # weighted_centroid requires intensity_image — ensure it's flagged so
     # the no-video early-skip filter excludes it correctly.
     assert "weighted_centroid" in _INTENSITY_PROPS
+
+
+# ===========================================================================
+# device='auto' / 'cuda' / 'mps' resolution (pyclesperanto/OpenCL backend)
+# ===========================================================================
+
+def test_resolve_device_cpu_passes_through():
+    from octron.tools import export_tracking as et
+    assert et._resolve_device("cpu") == "cpu"
+
+
+def test_resolve_device_mps_falls_back_to_cpu():
+    from octron.tools import export_tracking as et
+    assert et._resolve_device("mps") == "cpu"
+
+
+def test_resolve_device_auto_falls_back_to_cpu_when_no_gpu(monkeypatch):
+    """auto + no pyclesperanto/no device → cpu, no errors raised."""
+    from octron.tools import export_tracking as et
+    monkeypatch.setattr(et, "_pyclesperanto_available", lambda: False)
+    assert et._resolve_device("auto") == "cpu"
+
+
+def test_resolve_device_cuda_raises_when_unavailable(monkeypatch):
+    """device='cuda' is a hard request — fall-through to CPU would be silent
+    correctness ambiguity, so it must raise."""
+    from octron.tools import export_tracking as et
+    monkeypatch.setattr(et, "_pyclesperanto_available", lambda: False)
+    with pytest.raises(RuntimeError, match="pyclesperanto"):
+        et._resolve_device("cuda")
+
+
+def _has_pyclesperanto() -> bool:
+    """Module-level (not a fixture) so it can drive @pytest.mark.skipif."""
+    try:
+        import pyclesperanto as _cle
+        return bool(_cle.list_available_devices())
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _has_pyclesperanto(),
+                    reason="pyclesperanto not available")
+def test_gpu_path_matches_cpu_path(tmp_path):
+    """GPU and CPU paths must agree on a small synthetic mask dataset.
+
+    Covers a mix of GPU-native (extent, equivalent_diameter_area), CPU
+    fallback (eccentricity, solidity), and cross-path consistency.
+    """
+    import zarr
+    from octron.tools.export_tracking import compute_region_props_from_zarr
+
+    n, H, W = 3, 64, 64
+    store_path = tmp_path / "predictions.zarr"
+    store = zarr.storage.LocalStore(str(store_path))
+    root = zarr.open_group(store=store, mode="w")
+    arr = root.require_array("1_masks", shape=(n, H, W), dtype=np.int8)
+    arr[:] = 0
+    arr[:, 16:48, 16:48] = 1  # 32×32 square
+
+    properties = ["eccentricity", "solidity", "extent", "equivalent_diameter_area"]
+
+    cpu = compute_region_props_from_zarr(
+        zarr_root=root, track_ids=[1],
+        frame_indices_dict={1: np.arange(n)},
+        properties=properties,
+        zarr_path=store_path, video_path=None, device="cpu",
+    )
+    gpu = compute_region_props_from_zarr(
+        zarr_root=root, track_ids=[1],
+        frame_indices_dict={1: np.arange(n)},
+        properties=properties,
+        zarr_path=store_path, video_path=None, device="cuda",
+    )
+
+    assert set(cpu[1].keys()) == set(gpu[1].keys())
+    for col in cpu[1]:
+        cf = np.array([float(x) for x in cpu[1][col]])
+        gf = np.array([float(x) for x in gpu[1][col]])
+        np.testing.assert_allclose(
+            gf, cf, rtol=1e-5, atol=1e-5,
+            err_msg=f"GPU/CPU mismatch in {col}",
+        )
+
+
+def test_gpu_dispatch_does_not_use_processpool(monkeypatch):
+    """When device='cuda', ProcessPoolExecutor must NOT be instantiated.
+
+    Each spawned child process would create its own GPU context, serialise
+    on the same physical device, and (on Windows + OpenCL) often fail to
+    initialise at all. Lock down the contract so a future refactor can't
+    silently regress.
+    """
+    from octron.tools import export_tracking as et
+    import concurrent.futures as cf
+
+    monkeypatch.setattr(et, "_pyclesperanto_available", lambda: True)
+
+    def _fake_gpu_worker(args):
+        _, _, batch_fi, fi_positions, *_ = args
+        return ({}, batch_fi[0], batch_fi[-1], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(et, "_zarr_batch_worker_opencl", _fake_gpu_worker)
+
+    instantiations = []
+    real_pool = cf.ProcessPoolExecutor
+
+    def _spy(*args, **kwargs):
+        instantiations.append((args, kwargs))
+        return real_pool(*args, **kwargs)
+
+    monkeypatch.setattr(cf, "ProcessPoolExecutor", _spy)
+
+    import zarr
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        store_path = Path(tmp) / "p.zarr"
+        store = zarr.storage.LocalStore(str(store_path))
+        root = zarr.open_group(store=store, mode="w")
+        H, W, n = 16, 16, 3
+        arr = root.require_array("1_masks", shape=(n, H, W), dtype=np.int8)
+        arr[:] = 0
+        arr[:, 4:12, 4:12] = 1
+
+        et.compute_region_props_from_zarr(
+            zarr_root=root, track_ids=[1],
+            frame_indices_dict={1: np.arange(n)},
+            properties=["eccentricity"],
+            zarr_path=store_path, video_path=None, device="cuda",
+        )
+
+    assert instantiations == [], (
+        f"ProcessPoolExecutor was instantiated under device='cuda': "
+        f"{instantiations}"
+    )

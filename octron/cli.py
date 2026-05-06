@@ -279,6 +279,16 @@ def export(
         False, "--overwrite",
         help="Overwrite existing output files. Default: raise an error if files already exist.",
     ),
+    device: Device = typer.Option(
+        Device.auto, "--device",
+        help=(
+            "Compute backend for the regionprops step. 'auto' uses the "
+            "pyclesperanto/OpenCL GPU path when available, else CPU. 'cuda' "
+            "is a hard request for the GPU path (the backend is OpenCL, "
+            "which works on NVIDIA/AMD/Intel). 'mps' has no GPU regionprops "
+            "backend and falls back to CPU."
+        ),
+    ),
     list_properties: bool = typer.Option(
         False, "--list-properties",
         help="Print all available regionprop names and exit.",
@@ -314,6 +324,7 @@ def export(
         fmt=fmt.value,
         combined=combined,
         overwrite=overwrite,
+        device=device.value,
     )
 
 
