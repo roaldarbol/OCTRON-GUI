@@ -255,9 +255,14 @@ def _zarr_batch_worker(args):
 
         labeled = _measure.label(binary[r0:r1, c0:c1], background=0, connectivity=2)
         td = _pc()
-        props = _measure.regionprops_table(
-            labeled, intensity_image=intensity_crop, properties=sk_properties
-        )
+        # Suppress numpy's 0/0 RuntimeWarning from weighted_centroid (M/M0
+        # divide).  Regions with zero total intensity in a channel are
+        # legitimate in biological videos — we report them once per track
+        # in compute_region_props_from_zarr instead of as a noisy warning.
+        with _np.errstate(divide="ignore", invalid="ignore"):
+            props = _measure.regionprops_table(
+                labeled, intensity_image=intensity_crop, properties=sk_properties
+            )
         te = _pc()
 
         t_binary += tb - ta
@@ -875,6 +880,43 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
         all_keys = set()
         for row in rows:
             all_keys.update(row.keys())
+
+        # Detect region-frames where a channel had zero total intensity.
+        # weighted_* columns come back NaN for those — common in biological
+        # videos when one or more channels are dim or absent.  We surface
+        # this as one INFO line per track instead of skimage's per-call
+        # divide-by-zero RuntimeWarning.  Distinguish from "frame had no
+        # mask" NaN by requiring the column to be PRESENT in the row dict
+        # (rows[i] only has keys for frames where regionprops actually ran).
+        zero_intensity_counts = {}
+        for ch in _CHANNEL_LABELS:
+            suf = f"_{ch}"
+            ch_cols = [c for c in all_keys
+                       if c.startswith("weighted_") and c.endswith(suf)]
+            if not ch_cols:
+                continue
+            probe = ch_cols[0]  # all weighted_*_<ch> share NaN per (frame, ch)
+            n_bad = 0
+            for row in rows:
+                if probe not in row:
+                    continue
+                v = row[probe]
+                if isinstance(v, float) and v != v:
+                    n_bad += 1
+                elif isinstance(v, str) and "nan" in v.lower():
+                    n_bad += 1
+            if n_bad:
+                zero_intensity_counts[ch] = n_bad
+
+        if zero_intensity_counts:
+            summary = ", ".join(
+                f"{ch}={n}" for ch, n in zero_intensity_counts.items()
+            )
+            _log.info(
+                f"track {tid}: zero total intensity in some region-frames "
+                f"({summary}) — weighted_* columns are NaN for those entries. "
+                f"This is normal when a channel is dim or absent in the video."
+            )
 
         tid_result = {}
         for col_key in all_keys:
