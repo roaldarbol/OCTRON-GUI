@@ -823,3 +823,167 @@ def test_overwrite_false_no_error_when_output_dir_is_different(tmp_path):
     out.mkdir()
     export_tracking(tmp_path, output_dir=out, overwrite=False)  # should not raise
     assert (out / "animal_track_1.csv").exists()
+
+
+# ===========================================================================
+# Column renaming  (skimage '-N' suffixes → readable labels)
+# ===========================================================================
+
+def test_rename_intensity_channel_suffix():
+    from octron.tools.export_tracking import _rename_prop_column
+    assert _rename_prop_column("intensity_mean-0", has_intensity=True) == "intensity_mean_r"
+    assert _rename_prop_column("intensity_mean-1", has_intensity=True) == "intensity_mean_g"
+    assert _rename_prop_column("intensity_mean-2", has_intensity=True) == "intensity_mean_b"
+    assert _rename_prop_column("intensity_mean-3", has_intensity=True) == "intensity_mean_lum"
+
+
+def test_rename_weighted_centroid_axis_channel():
+    from octron.tools.export_tracking import _rename_prop_column
+    assert _rename_prop_column("weighted_centroid-0-0", True) == "weighted_centroid_y_r"
+    assert _rename_prop_column("weighted_centroid-0-1", True) == "weighted_centroid_y_g"
+    assert _rename_prop_column("weighted_centroid-0-2", True) == "weighted_centroid_y_b"
+    assert _rename_prop_column("weighted_centroid-0-3", True) == "weighted_centroid_y_lum"
+    assert _rename_prop_column("weighted_centroid-1-0", True) == "weighted_centroid_x_r"
+    assert _rename_prop_column("weighted_centroid-1-3", True) == "weighted_centroid_x_lum"
+
+
+def test_rename_centroid_axis_only():
+    from octron.tools.export_tracking import _rename_prop_column
+    assert _rename_prop_column("centroid-0", has_intensity=False) == "centroid_y"
+    assert _rename_prop_column("centroid-1", has_intensity=False) == "centroid_x"
+
+
+def test_rename_moments_hu_unchanged():
+    from octron.tools.export_tracking import _rename_prop_column
+    assert _rename_prop_column("moments_hu-0", has_intensity=False) == "moments_hu-0"
+    assert _rename_prop_column("moments_hu-6", has_intensity=False) == "moments_hu-6"
+
+
+def test_rename_bare_property_unchanged():
+    from octron.tools.export_tracking import _rename_prop_column
+    assert _rename_prop_column("eccentricity", has_intensity=False) == "eccentricity"
+    assert _rename_prop_column("solidity", has_intensity=True) == "solidity"
+
+
+# ===========================================================================
+# Bbox-offset correction for translation-variant regionprops
+# ===========================================================================
+
+def _build_synthetic_mask_and_intensity(H=64, W=64, y0=10, x0=12, h=20, w=24):
+    """Build a binary mask with a single rectangular region + 4-channel intensity."""
+    mask = np.zeros((H, W), dtype=np.int8)
+    mask[y0:y0+h, x0:x0+w] = 1
+    rng = np.random.default_rng(42)
+    # 4 channels (R, G, B, lum) — random integers in 0..255
+    intensity = rng.integers(0, 256, size=(H, W, 4), dtype=np.int32).astype(np.uint8)
+    return mask, intensity
+
+
+def test_weighted_centroid_bbox_offset_matches_full_image():
+    """Cropping then offsetting must match running on the full image."""
+    from skimage import measure
+    from octron.tools.export_tracking import _TRANSLATION_VARIANT_PROPS
+
+    H, W, y0, x0, h, w = 64, 64, 10, 12, 20, 24
+    mask, intensity = _build_synthetic_mask_and_intensity(H, W, y0, x0, h, w)
+
+    properties = ["weighted_centroid", "centroid", "area", "intensity_mean"]
+
+    # Full-image (correct reference)
+    full_labeled = measure.label(mask, background=0, connectivity=2)
+    full = measure.regionprops_table(
+        full_labeled, intensity_image=intensity, properties=properties
+    )
+
+    # Cropped (would silently shift values for variant props)
+    rows_any = mask.any(axis=1); cols_any = mask.any(axis=0)
+    r0 = int(rows_any.argmax())
+    r1 = int(len(rows_any) - rows_any[::-1].argmax())
+    c0 = int(cols_any.argmax())
+    c1 = int(len(cols_any) - cols_any[::-1].argmax())
+
+    crop_labeled = measure.label(mask[r0:r1, c0:c1], background=0, connectivity=2)
+    cropped = measure.regionprops_table(
+        crop_labeled, intensity_image=intensity[r0:r1, c0:c1],
+        properties=properties,
+    )
+
+    # Apply the same offset correction the worker does.
+    for col_key, vals in list(cropped.items()):
+        base = col_key.split("-")[0]
+        if base not in _TRANSLATION_VARIANT_PROPS:
+            continue
+        ax_idx = int(col_key.split("-")[1])
+        offset = r0 if ax_idx == 0 else c0
+        cropped[col_key] = vals + offset
+
+    for col_key in full:
+        np.testing.assert_allclose(
+            cropped[col_key], full[col_key], rtol=1e-6, atol=1e-6,
+            err_msg=f"Mismatch in column {col_key} after offset correction",
+        )
+
+
+def test_weighted_centroid_displacement_signal():
+    """R-channel intensity on the LEFT, B-channel on the RIGHT —
+    weighted_centroid_x_r must lie left of weighted_centroid_x_b."""
+    from skimage import measure
+
+    H, W = 32, 64
+    mask = np.zeros((H, W), dtype=np.int8)
+    mask[8:24, 8:56] = 1
+    intensity = np.zeros((H, W, 4), dtype=np.uint8)
+    intensity[:, :W // 2, 0] = 200    # R bright on the left
+    intensity[:, W // 2:, 2] = 200    # B bright on the right
+
+    labeled = measure.label(mask, background=0, connectivity=2)
+    out = measure.regionprops_table(
+        labeled, intensity_image=intensity, properties=["weighted_centroid"]
+    )
+    # axis-1 (x) channel-0 (R) and channel-2 (B)
+    x_r = out["weighted_centroid-1-0"][0]
+    x_b = out["weighted_centroid-1-2"][0]
+    assert x_r < x_b, f"Expected R-weighted x ({x_r}) < B-weighted x ({x_b})"
+
+
+# ===========================================================================
+# _ordered_columns expansion
+# ===========================================================================
+
+def test_ordered_columns_includes_axis_channel_expansions():
+    from octron.tools.export_tracking import _ordered_columns
+
+    cols = [
+        "label", "confidence", "pos_x", "pos_y", "area",
+        "weighted_centroid_y_r", "weighted_centroid_x_r",
+        "weighted_centroid_y_lum", "weighted_centroid_x_lum",
+        "intensity_mean_r", "intensity_mean_lum",
+        "eccentricity",
+    ]
+    ordered = _ordered_columns(cols)
+    # Every input column survives the ordering step.
+    assert set(ordered) == set(cols)
+    # Channel-only intensity expansion comes before axis-channel expansion
+    # (intensity_mean before weighted_centroid in ALL_REGION_PROPERTIES order).
+    assert ordered.index("intensity_mean_r") < ordered.index("weighted_centroid_y_r")
+    # Within weighted_centroid, axis-y comes before axis-x.
+    assert ordered.index("weighted_centroid_y_r") < ordered.index("weighted_centroid_x_r")
+
+
+def test_translation_variant_set_classification():
+    """Defensive: shape props should NOT be in the variant set; the variant
+    set must contain centroid and weighted_centroid."""
+    from octron.tools.export_tracking import _TRANSLATION_VARIANT_PROPS, _INTENSITY_PROPS
+    from octron.yolo_octron.constants import ALL_REGION_PROPERTIES
+
+    assert "centroid" in _TRANSLATION_VARIANT_PROPS
+    assert "weighted_centroid" in _TRANSLATION_VARIANT_PROPS
+
+    shape_props = set(ALL_REGION_PROPERTIES["Size and Shape"])
+    # None of the size/shape props should be flagged variant — they are all
+    # translation-invariant (eccentricity, perimeter, moments_hu, …).
+    assert shape_props.isdisjoint(_TRANSLATION_VARIANT_PROPS)
+
+    # weighted_centroid requires intensity_image — ensure it's flagged so
+    # the no-video early-skip filter excludes it correctly.
+    assert "weighted_centroid" in _INTENSITY_PROPS

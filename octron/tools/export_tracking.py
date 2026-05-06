@@ -56,13 +56,102 @@ import numpy as np
 #   intensity_mean_r, intensity_mean_g, intensity_mean_b, intensity_mean_lum
 _INTENSITY_PROPS = frozenset({
     "intensity_max", "intensity_mean", "intensity_min", "intensity_std",
+    "weighted_centroid",
 })
 
-# Rename skimage's numeric channel suffixes to readable labels.
-# Channels are stacked as (R, G, B, luminance) in the worker.
-_CHANNEL_SUFFIX = {"-0": "_r", "-1": "_g", "-2": "_b", "-3": "_lum"}
+# Properties whose values are NOT translation-invariant: they depend on the
+# absolute pixel coordinates, so cropping the input shifts the output by the
+# bbox origin and the result must be offset back into full-frame coordinates.
+# (Plain `bbox` columns are emitted from the bbox-detection step, not from
+# regionprops, so they are not listed here.)
+_TRANSLATION_VARIANT_PROPS = frozenset({
+    "centroid",
+    "weighted_centroid",
+})
+
+# Properties whose multichannel-intensity output gains an extra trailing
+# channel suffix on a 4-channel intensity image (R, G, B, luminance):
+#   intensity_mean-0..3  →  intensity_mean_{r,g,b,lum}
+#   weighted_centroid-{axis}-{channel}  →  weighted_centroid_{y,x}_{r,g,b,lum}
+_MULTICHANNEL_INTENSITY_PROPS = frozenset({
+    "intensity_max", "intensity_mean", "intensity_min", "intensity_std",
+    "weighted_centroid",
+})
+
+# Properties whose first numeric suffix is a spatial axis (y, x).
+_POSITION_PROPS = frozenset({"centroid", "weighted_centroid"})
+
+_AXIS_LABELS = ("y", "x")
+_CHANNEL_LABELS = ("r", "g", "b", "lum")
 
 _PROPS_BATCH = 500  # zarr frames per contiguous read when computing props
+
+
+def _rename_prop_column(col_key, has_intensity):
+    """Rename skimage's numeric '-N' suffixes to readable labels.
+
+    Skimage's regionprops_table flattens multi-dimensional outputs by suffixing
+    each numeric index, with the channel axis appended last when the intensity
+    image is multi-channel.  For our 4-channel (R, G, B, luminance) layout:
+
+      intensity_mean-0           →  intensity_mean_r
+      weighted_centroid-0-0      →  weighted_centroid_y_r
+      weighted_centroid-1-3      →  weighted_centroid_x_lum
+      centroid-0                 →  centroid_y
+      moments_hu-0               →  moments_hu-0           (unchanged)
+
+    The ``has_intensity`` flag tells us whether to interpret the trailing
+    index as a channel — without an intensity image, even multichannel-aware
+    props like ``weighted_centroid`` are not present.
+    """
+    parts = col_key.split("-")
+    if len(parts) == 1:
+        return col_key
+
+    base = parts[0]
+    nums = parts[1:]
+
+    is_pos = base in _POSITION_PROPS
+    is_multich_intensity = has_intensity and base in _MULTICHANNEL_INTENSITY_PROPS
+
+    if is_multich_intensity:
+        try:
+            ch_idx = int(nums[-1])
+        except ValueError:
+            return col_key
+        ch_label = (
+            _CHANNEL_LABELS[ch_idx]
+            if 0 <= ch_idx < len(_CHANNEL_LABELS) else nums[-1]
+        )
+        spatial = nums[:-1]
+        if is_pos and len(spatial) == 1:
+            try:
+                ax_idx = int(spatial[0])
+            except ValueError:
+                return col_key
+            ax_label = (
+                _AXIS_LABELS[ax_idx]
+                if 0 <= ax_idx < len(_AXIS_LABELS) else spatial[0]
+            )
+            return f"{base}_{ax_label}_{ch_label}"
+        if not spatial:
+            return f"{base}_{ch_label}"
+        # Unexpected spatial-suffix shape — keep as-is to avoid silent loss.
+        return col_key
+
+    if is_pos and len(nums) == 1:
+        try:
+            ax_idx = int(nums[0])
+        except ValueError:
+            return col_key
+        ax_label = (
+            _AXIS_LABELS[ax_idx]
+            if 0 <= ax_idx < len(_AXIS_LABELS) else nums[0]
+        )
+        return f"{base}_{ax_label}"
+
+    # Default: keep multi-value expansions like moments_hu-0..6 unchanged.
+    return col_key
 
 
 def _zarr_batch_worker(args):
@@ -142,17 +231,36 @@ def _zarr_batch_worker(args):
         t_label += td - tc
         t_props += te - td
 
+        # Crop-then-compute is correct only for translation-invariant
+        # properties.  For variant ones (centroid, weighted_centroid)
+        # we shift each spatial axis back into full-frame coordinates.
+        # Skimage names the spatial axis as the FIRST numeric suffix:
+        #   centroid-0          → axis 0 (y) → add r0
+        #   centroid-1          → axis 1 (x) → add c0
+        #   weighted_centroid-0-{ch}  → axis 0 (y) → add r0
+        #   weighted_centroid-1-{ch}  → axis 1 (x) → add c0
+        for col_key, vals in props.items():
+            base = col_key.split("-")[0]
+            if base not in _TRANSLATION_VARIANT_PROPS:
+                continue
+            parts = col_key.split("-")
+            if len(parts) < 2:
+                continue
+            try:
+                ax_idx = int(parts[1])
+            except ValueError:
+                continue
+            offset = r0 if ax_idx == 0 else c0 if ax_idx == 1 else 0
+            if offset:
+                props[col_key] = vals + offset
+
         frame_result = {}
-        _ch = {"-0": "_r", "-1": "_g", "-2": "_b", "-3": "_lum"}
+        has_intensity = intensity_crop is not None
         for col_key, vals in props.items():
             base = col_key.split("-")[0]
             if base not in computable and col_key not in computable:
                 continue
-            out_key = col_key
-            for old_suf, new_suf in _ch.items():
-                if col_key.endswith(old_suf):
-                    out_key = col_key[: -len(old_suf)] + new_suf
-                    break
+            out_key = _rename_prop_column(col_key, has_intensity)
             frame_result[out_key] = (
                 float(vals[0]) if len(vals) == 1
                 else str(tuple(float(v) for v in vals))
@@ -303,9 +411,10 @@ def _ordered_columns(df_columns):
     """Return df_columns in canonical order.
 
     Order: base cols → shape props → intensity props (ALL_REGION_PROPERTIES
-    order).  Multi-value expansions (moments_hu-0 … -6) and channel
-    expansions (intensity_mean_r/g/b/lum) are grouped immediately after
-    their base name.  Unknown columns follow at the end.
+    order).  Multi-value expansions (moments_hu-0 … -6), channel expansions
+    (intensity_mean_r/g/b/lum), axis expansions (centroid_y/x), and
+    axis-channel expansions (weighted_centroid_y_r … _x_lum) are all grouped
+    immediately after their base name.  Unknown columns follow at the end.
     """
     from octron.yolo_octron.constants import ALL_REGION_PROPERTIES
 
@@ -329,6 +438,10 @@ def _ordered_columns(df_columns):
             _add(c)
         for suf in _CHANNEL_SUFFIXES:
             _add(prop + suf)
+        for ax in _AXIS_LABELS:
+            _add(f"{prop}_{ax}")
+            for suf in _CHANNEL_SUFFIXES:
+                _add(f"{prop}_{ax}{suf}")
 
     for col in _COL_BASE:
         _add(col)
