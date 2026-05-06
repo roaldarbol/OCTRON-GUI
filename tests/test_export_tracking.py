@@ -970,6 +970,149 @@ def test_ordered_columns_includes_axis_channel_expansions():
     assert ordered.index("weighted_centroid_y_r") < ordered.index("weighted_centroid_x_r")
 
 
+# ===========================================================================
+# Intensity-weighted spread (weighted_var_y / weighted_var_x / weighted_cov_yx)
+# ===========================================================================
+
+def _weighted_var_xy_reference(intensity_2d):
+    """Reference μ_20/μ_00 and μ_02/μ_00 over the full image, single channel."""
+    H, W = intensity_2d.shape
+    yy, xx = np.mgrid[:H, :W].astype(float)
+    I = intensity_2d.astype(float)
+    m00 = I.sum()
+    cy = (yy * I).sum() / m00
+    cx = (xx * I).sum() / m00
+    var_y = ((yy - cy) ** 2 * I).sum() / m00
+    var_x = ((xx - cx) ** 2 * I).sum() / m00
+    cov_yx = ((yy - cy) * (xx - cx) * I).sum() / m00
+    return var_y, var_x, cov_yx
+
+
+def test_weighted_var_matches_manual_reference():
+    """Pseudo-prop derivation in the worker post-process must match a hand-rolled
+    intensity-weighted variance/covariance computation."""
+    from skimage import measure
+    from octron.tools.export_tracking import _SPREAD_FROM_MOMENT
+
+    H, W = 40, 60
+    mask = np.zeros((H, W), dtype=np.int8)
+    mask[5:35, 8:52] = 1
+
+    rng = np.random.default_rng(0)
+    intensity_1ch = rng.integers(50, 200, size=(H, W), dtype=np.int32).astype(np.uint8)
+
+    # Multi-channel image with the same data on the R channel; other channels
+    # left at zero so we focus on a single channel comparison.
+    intensity = np.zeros((H, W, 4), dtype=np.uint8)
+    intensity[..., 0] = intensity_1ch  # R
+
+    var_y_ref, var_x_ref, cov_yx_ref = _weighted_var_xy_reference(
+        intensity_1ch * mask
+    )
+
+    labeled = measure.label(mask, background=0, connectivity=2)
+    raw = measure.regionprops_table(
+        labeled, intensity_image=intensity,
+        properties=["weighted_moments_central"],
+    )
+    # Replicate the worker's derivation for channel 0.
+    m00 = raw["weighted_moments_central-0-0-0"][0]
+    derived = {}
+    for (i, j), base in _SPREAD_FROM_MOMENT.items():
+        derived[base] = raw[f"weighted_moments_central-{i}-{j}-0"][0] / m00
+
+    assert derived["weighted_var_y"] == pytest.approx(var_y_ref, rel=1e-6)
+    assert derived["weighted_var_x"] == pytest.approx(var_x_ref, rel=1e-6)
+    assert derived["weighted_cov_yx"] == pytest.approx(cov_yx_ref, rel=1e-6)
+
+
+def test_weighted_var_x_signals_horizontal_spread():
+    """Wider region should produce larger weighted_var_x than a narrower one."""
+    from skimage import measure
+    from octron.tools.export_tracking import _SPREAD_FROM_MOMENT
+
+    def _var_x_for(width):
+        H, W = 32, 96
+        mask = np.zeros((H, W), dtype=np.int8)
+        x_lo = (W - width) // 2
+        mask[8:24, x_lo : x_lo + width] = 1
+        intensity = np.zeros((H, W, 4), dtype=np.uint8)
+        # Uniform R intensity inside the mask
+        intensity[..., 0] = (mask.astype(np.int32) * 200).astype(np.uint8)
+        labeled = measure.label(mask, background=0, connectivity=2)
+        out = measure.regionprops_table(
+            labeled, intensity_image=intensity,
+            properties=["weighted_moments_central"],
+        )
+        m00 = out["weighted_moments_central-0-0-0"][0]
+        m02 = out["weighted_moments_central-0-2-0"][0]
+        return m02 / m00
+
+    narrow = _var_x_for(width=10)
+    wide   = _var_x_for(width=60)
+    assert wide > narrow
+
+
+def test_weighted_spread_columns_via_export(tmp_path):
+    """End-to-end: requesting weighted_var_y from the public export should
+    produce a numeric column populated from zarr masks + video pixels."""
+    import zarr
+    import cv2
+
+    pytest.importorskip("cv2")
+
+    csv_path = tmp_path / "animal_track_1.csv"
+    _write_prediction_csv(csv_path, track_id=1, n=3)
+    df = pd.read_csv(csv_path, skiprows=7)
+    n = len(df)
+
+    # Tiny zarr store with a centred square mask each frame.
+    store_path = tmp_path / "predictions.zarr"
+    store = zarr.storage.LocalStore(str(store_path))
+    root = zarr.open_group(store=store, mode="w")
+    H, W = 64, 64
+    masks = np.zeros((n, H, W), dtype=np.int8)
+    masks[:, 16:48, 16:48] = 1
+    arr = root.require_array("1_masks", shape=(n, H, W), dtype=np.int8)
+    arr[:] = masks
+
+    # Tiny matching video — uniform red so the R-channel weighted variance
+    # is finite and equal to the geometric variance of the mask.
+    video_path = tmp_path / "vid.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(video_path), fourcc, 5, (W, H))
+    if not writer.isOpened():
+        pytest.skip("cv2 VideoWriter unavailable in this environment")
+    frame = np.zeros((H, W, 3), dtype=np.uint8)
+    frame[..., 2] = 255  # BGR red
+    for _ in range(n):
+        writer.write(frame)
+    writer.release()
+
+    export_tracking(
+        tmp_path, output_dir=tmp_path,
+        region_properties=["weighted_var_y", "weighted_var_x", "weighted_cov_yx"],
+        video_path=video_path, overwrite=True,
+    )
+    out = pd.read_csv(csv_path, skiprows=7)
+    for col in ("weighted_var_y_r", "weighted_var_x_r", "weighted_cov_yx_r"):
+        assert col in out.columns, f"Missing derived column: {col}"
+        assert out[col].notna().all(), f"Column {col} has NaNs"
+    # Symmetric mask centred in the frame → cov_yx ≈ 0
+    assert abs(out["weighted_cov_yx_r"].iloc[0]) < 1e-6
+    # Square mask → var_y ≈ var_x
+    np.testing.assert_allclose(
+        out["weighted_var_y_r"].values, out["weighted_var_x_r"].values, atol=1e-6,
+    )
+
+
+def test_weighted_spread_in_intensity_props_set():
+    """Pseudo-props must be flagged intensity-requiring so they're skipped
+    when no video is provided (rather than silently producing NaN)."""
+    from octron.tools.export_tracking import _INTENSITY_PROPS, _WEIGHTED_SPREAD_PROPS
+    assert _WEIGHTED_SPREAD_PROPS <= _INTENSITY_PROPS
+
+
 def test_translation_variant_set_classification():
     """Defensive: shape props should NOT be in the variant set; the variant
     set must contain centroid and weighted_centroid."""

@@ -57,7 +57,30 @@ import numpy as np
 _INTENSITY_PROPS = frozenset({
     "intensity_max", "intensity_mean", "intensity_min", "intensity_std",
     "weighted_centroid",
+    # Intensity-weighted spatial spread of the per-channel pixel intensities
+    # (variance and covariance about the weighted centroid, per channel).
+    "weighted_var_y", "weighted_var_x", "weighted_cov_yx",
 })
+
+# Pseudo-properties derived from skimage's weighted_moments_central (μ_pq):
+#   weighted_var_y    = μ_20 / μ_00   (intensity-weighted variance along y)
+#   weighted_var_x    = μ_02 / μ_00   (intensity-weighted variance along x)
+#   weighted_cov_yx   = μ_11 / μ_00   (intensity-weighted yx covariance)
+# Each is emitted per channel: e.g. weighted_var_y_r … _lum.
+# These are the "spread" companions to weighted_centroid: small variance →
+# pixels of that colour cluster tightly around the weighted centroid; large
+# variance → they are spread out.  All three are translation-invariant, so
+# they need no bbox-offset correction.
+_WEIGHTED_SPREAD_PROPS = frozenset({
+    "weighted_var_y", "weighted_var_x", "weighted_cov_yx",
+})
+
+# (i, j) suffix on weighted_moments_central → derived spread base name.
+_SPREAD_FROM_MOMENT = {
+    ("2", "0"): "weighted_var_y",
+    ("0", "2"): "weighted_var_x",
+    ("1", "1"): "weighted_cov_yx",
+}
 
 # Properties whose values are NOT translation-invariant: they depend on the
 # absolute pixel coordinates, so cropping the input shifts the output by the
@@ -73,9 +96,11 @@ _TRANSLATION_VARIANT_PROPS = frozenset({
 # channel suffix on a 4-channel intensity image (R, G, B, luminance):
 #   intensity_mean-0..3  →  intensity_mean_{r,g,b,lum}
 #   weighted_centroid-{axis}-{channel}  →  weighted_centroid_{y,x}_{r,g,b,lum}
+#   weighted_var_y-{channel}  →  weighted_var_y_{r,g,b,lum}
 _MULTICHANNEL_INTENSITY_PROPS = frozenset({
     "intensity_max", "intensity_mean", "intensity_min", "intensity_std",
     "weighted_centroid",
+    "weighted_var_y", "weighted_var_x", "weighted_cov_yx",
 })
 
 # Properties whose first numeric suffix is a spatial axis (y, x).
@@ -168,6 +193,15 @@ def _zarr_batch_worker(args):
     from time import perf_counter as _pc
     from pathlib import Path as _Path
 
+    # Translate pseudo-properties to the underlying skimage names.  We expose
+    # weighted_var_y/x and weighted_cov_yx as user-friendly columns derived
+    # from weighted_moments_central; skimage doesn't know those names, so we
+    # ask for the moments and post-process below.
+    wanted_spread = [p for p in computable if p in _WEIGHTED_SPREAD_PROPS]
+    sk_properties = [p for p in computable if p not in _WEIGHTED_SPREAD_PROPS]
+    if wanted_spread and "weighted_moments_central" not in sk_properties:
+        sk_properties.append("weighted_moments_central")
+
     store = _zarr.storage.LocalStore(_Path(zarr_store_path), read_only=True)
     root = _zarr.open_group(store=store, mode="r")
     zarr_arr = root[arr_key]
@@ -222,7 +256,7 @@ def _zarr_batch_worker(args):
         labeled = _measure.label(binary[r0:r1, c0:c1], background=0, connectivity=2)
         td = _pc()
         props = _measure.regionprops_table(
-            labeled, intensity_image=intensity_crop, properties=computable
+            labeled, intensity_image=intensity_crop, properties=sk_properties
         )
         te = _pc()
 
@@ -230,6 +264,28 @@ def _zarr_batch_worker(args):
         t_bbox += tc - tb
         t_label += td - tc
         t_props += te - td
+
+        # Derive intensity-weighted spread columns from weighted_moments_central:
+        #   weighted_var_y_{ch}  = μ_20 / μ_00   (variance along y, per channel)
+        #   weighted_var_x_{ch}  = μ_02 / μ_00
+        #   weighted_cov_yx_{ch} = μ_11 / μ_00
+        # Stored under pseudo-prop names with a single channel suffix so the
+        # downstream rename helper produces e.g. weighted_var_y_r.
+        if wanted_spread and intensity_crop is not None:
+            n_channels = intensity_crop.shape[2] if intensity_crop.ndim == 3 else 1
+            for ch in range(n_channels):
+                m00 = props.get(f"weighted_moments_central-0-0-{ch}")
+                if m00 is None:
+                    continue
+                for (i, j), base in _SPREAD_FROM_MOMENT.items():
+                    if base not in wanted_spread:
+                        continue
+                    m_ij = props.get(f"weighted_moments_central-{i}-{j}-{ch}")
+                    if m_ij is None:
+                        continue
+                    with _np.errstate(divide="ignore", invalid="ignore"):
+                        derived = _np.where(m00 != 0, m_ij / m00, _np.nan)
+                    props[f"{base}-{ch}"] = derived
 
         # Crop-then-compute is correct only for translation-invariant
         # properties.  For variant ones (centroid, weighted_centroid)

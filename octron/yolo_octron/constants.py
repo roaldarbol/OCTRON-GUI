@@ -34,6 +34,9 @@ ALL_REGION_PROPERTIES = {
         'intensity_min',
         'intensity_std',
         'weighted_centroid',
+        'weighted_var_y',
+        'weighted_var_x',
+        'weighted_cov_yx',
     ),
 }
 
