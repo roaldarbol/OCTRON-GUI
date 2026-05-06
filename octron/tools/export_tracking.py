@@ -109,8 +109,8 @@ _POSITION_PROPS = frozenset({"centroid", "weighted_centroid"})
 _AXIS_LABELS = ("y", "x")
 _CHANNEL_LABELS = ("r", "g", "b", "lum")
 
-_PROPS_BATCH = 500       # CPU: zarr frames per contiguous read when computing props
-_PROPS_BATCH_GPU = 2000  # GPU: larger batches amortise per-call kernel-launch overhead
+_PROPS_BATCH = 500     # zarr frames per contiguous read when computing props
+_OPENCL_WORKERS = 4    # OpenCL contexts on one GPU; bounded to avoid VRAM blow-up
 
 # Properties that pyclesperanto's statistics_of_labelled_pixels can produce
 # directly (or that we derive cheaply from those primitives in numpy on host).
@@ -397,17 +397,19 @@ def _zarr_batch_worker(args):
 
 
 def _zarr_batch_worker_opencl(args):
-    """In-process pyclesperanto/OpenCL worker — same args/returns as the CPU
-    worker.
+    """Process-pool worker for the pyclesperanto/OpenCL GPU path.
 
-    Routes connected-components labelling and intensity statistics through the
-    GPU; falls back to skimage on host (against the SAME labelled image, no
-    double work) for any property pyclesperanto doesn't expose — e.g.
+    Same args/returns as ``_zarr_batch_worker``.  Each worker process
+    imports pyclesperanto independently and creates its own OpenCL context;
+    OpenCL contexts are lightweight enough on NVIDIA Windows that a small
+    pool (typically 4) on one physical device is fine and gives us the host
+    I/O parallelism that a single-context serial design would give up.
+
+    Routes connected-components labelling and intensity statistics through
+    the GPU; falls back to skimage on host (against the SAME labelled image,
+    no double work) for any property pyclesperanto doesn't expose — e.g.
     eccentricity, perimeter, moments_hu, weighted_moments_central (the basis
     for our weighted_var/cov spread features).
-
-    Must be called serially from the main process.  ProcessPoolExecutor on
-    top of one OpenCL context per child process is a footgun.
     """
     zarr_store_path, arr_key, batch_fi, fi_positions, computable, video_path, mask_h, mask_w = args
     import zarr as _zarr
@@ -1039,29 +1041,33 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
 
     resolved_device = _resolve_device(device)
     on_gpu = resolved_device == "opencl"
+    batch_size = _PROPS_BATCH
+
     if on_gpu:
         gpu_native = _OPENCL_NATIVE & set(computable)
         cpu_residual = sorted(set(computable) - _OPENCL_NATIVE)
+        n_workers = min(_OPENCL_WORKERS, os.cpu_count() or 1)
         _log.info(
-            f"Using pyclesperanto (OpenCL GPU) for regionprops. "
-            f"GPU-native: {sorted(gpu_native) or '[]'}; "
+            f"Using pyclesperanto (OpenCL GPU) for regionprops with "
+            f"{n_workers} worker(s). GPU-native: {sorted(gpu_native) or '[]'}; "
             f"CPU fallback: {cpu_residual or '[]'}."
         )
         worker_fn = _zarr_batch_worker_opencl
-        batch_size = _PROPS_BATCH_GPU
-        n_workers = 1  # serial, in-process
     else:
         n_workers = min(8, os.cpu_count() or 4)
-        # ProcessPoolExecutor bypasses the GIL for true CPU parallelism.
-        # Falls back to threads only if the zarr path is unavailable.
-        use_processes = zarr_path is not None
-        ExecutorClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
-        _log.debug(
-            f"Using {'ProcessPoolExecutor' if use_processes else 'ThreadPoolExecutor'} "
-            f"with {n_workers} workers"
-        )
         worker_fn = _zarr_batch_worker
-        batch_size = _PROPS_BATCH
+        _log.debug(f"Using ProcessPoolExecutor with {n_workers} worker(s) (CPU)")
+
+    # ProcessPoolExecutor bypasses the GIL and parallelises the host-side
+    # work in both paths.  For the GPU path: each worker process imports
+    # pyclesperanto and creates its own OpenCL context — these are
+    # lightweight enough on NVIDIA OpenCL (a few hundred MB each) that
+    # 4 of them on one device is fine, and the host I/O parallelism is
+    # exactly what we'd give up by going serial.  ThreadPoolExecutor is
+    # only used as a fallback when zarr_path is None (then workers can't
+    # re-open the store independently).
+    use_processes = zarr_path is not None
+    ExecutorClass = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
 
     result = {}
 
@@ -1117,14 +1123,8 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
                 for pos, frame_result in batch_results.items():
                     rows[pos].update(frame_result)
 
-        if on_gpu:
-            # Serial dispatch — one OpenCL context, large batches amortise
-            # kernel-launch overhead.  ProcessPoolExecutor on top of a single
-            # GPU context is the well-known footgun this path avoids.
-            _consume_batch_results(map(worker_fn, batch_args))
-        else:
-            with ExecutorClass(max_workers=n_workers) as executor:
-                _consume_batch_results(executor.map(worker_fn, batch_args))
+        with ExecutorClass(max_workers=n_workers) as executor:
+            _consume_batch_results(executor.map(worker_fn, batch_args))
 
         # Collect all column names that actually appeared (handles expansion)
         all_keys = set()

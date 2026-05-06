@@ -90,6 +90,15 @@ from octron.tools.export_tracking import (
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _stub_gpu_worker(args):
+    """Module-level stub so ProcessPoolExecutor can pickle it on Windows
+    spawn.  Used by ``test_gpu_dispatch_uses_processpool_with_bounded_workers``
+    in place of the real OpenCL worker (which would require pyclesperanto to
+    initialise inside spawned children)."""
+    _, _, batch_fi, _fi_positions, *_ = args
+    return ({}, batch_fi[0], batch_fi[-1], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
 def _scalar_arr(*vals):
     return np.array(vals, dtype=object)
 
@@ -1215,24 +1224,20 @@ def test_gpu_path_matches_cpu_path(tmp_path):
         )
 
 
-def test_gpu_dispatch_does_not_use_processpool(monkeypatch):
-    """When device='cuda', ProcessPoolExecutor must NOT be instantiated.
+def test_gpu_dispatch_uses_processpool_with_bounded_workers(monkeypatch):
+    """The GPU path runs through ProcessPoolExecutor with ``_OPENCL_WORKERS``
+    workers (bounded) so host I/O + skimage CPU fallback parallelise across
+    a small set of OpenCL contexts on the same device.
 
-    Each spawned child process would create its own GPU context, serialise
-    on the same physical device, and (on Windows + OpenCL) often fail to
-    initialise at all. Lock down the contract so a future refactor can't
-    silently regress.
+    Lock down the contract: a single-process serial design would give up the
+    host-I/O parallelism that's most of the wall-time win on this workload.
     """
     from octron.tools import export_tracking as et
     import concurrent.futures as cf
 
     monkeypatch.setattr(et, "_pyclesperanto_available", lambda: True)
-
-    def _fake_gpu_worker(args):
-        _, _, batch_fi, fi_positions, *_ = args
-        return ({}, batch_fi[0], batch_fi[-1], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-
-    monkeypatch.setattr(et, "_zarr_batch_worker_opencl", _fake_gpu_worker)
+    # Module-level stub so the ProcessPoolExecutor children can pickle it.
+    monkeypatch.setattr(et, "_zarr_batch_worker_opencl", _stub_gpu_worker)
 
     instantiations = []
     real_pool = cf.ProcessPoolExecutor
@@ -1261,7 +1266,12 @@ def test_gpu_dispatch_does_not_use_processpool(monkeypatch):
             zarr_path=store_path, video_path=None, device="cuda",
         )
 
-    assert instantiations == [], (
-        f"ProcessPoolExecutor was instantiated under device='cuda': "
-        f"{instantiations}"
+    assert len(instantiations) == 1, (
+        f"Expected exactly one ProcessPoolExecutor under device='cuda'; got "
+        f"{len(instantiations)}: {instantiations}"
+    )
+    requested_workers = instantiations[0][1].get("max_workers")
+    assert requested_workers is not None and requested_workers <= et._OPENCL_WORKERS, (
+        f"GPU pool was sized {requested_workers}, must be ≤ "
+        f"_OPENCL_WORKERS={et._OPENCL_WORKERS} to bound VRAM use."
     )
