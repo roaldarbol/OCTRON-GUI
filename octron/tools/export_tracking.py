@@ -219,6 +219,8 @@ def _zarr_batch_worker(args):
 
     results = {}
     t_binary = t_bbox = t_label = t_props = 0.0
+    n_video_misses = 0
+    needs_intensity = bool(cap is not None and any(p in _INTENSITY_PROPS for p in computable))
     for fi, pos in zip(batch_fi, fi_positions):
         raw = raw_batch[fi - fi_lo]
 
@@ -252,6 +254,14 @@ def _zarr_batch_worker(args):
                 rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
                 lum = _cv2.cvtColor(frame, _cv2.COLOR_BGR2GRAY)
                 intensity_crop = _np.dstack([rgb, lum])[r0:r1, c0:c1]
+            elif needs_intensity:
+                # Video read failed (EOF past zarr's frame count, transient
+                # network glitch, or corrupted frame).  Skip rather than feed
+                # intensity_image=None into a regionprops_table that requested
+                # intensity_max/_mean/_min/_std/weighted_centroid/weighted_var*
+                # — skimage raises AttributeError on the first such property.
+                n_video_misses += 1
+                continue
 
         labeled = _measure.label(binary[r0:r1, c0:c1], background=0, connectivity=2)
         td = _pc()
@@ -332,7 +342,8 @@ def _zarr_batch_worker(args):
     if cap is not None:
         cap.release()
 
-    return results, fi_lo, fi_hi, t1 - t0, _pc() - t1, t_binary, t_bbox, t_label, t_props
+    return (results, fi_lo, fi_hi, t1 - t0, _pc() - t1,
+            t_binary, t_bbox, t_label, t_props, n_video_misses)
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +821,7 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
         return {}
 
     import os
-    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
     n_workers = min(8, os.cpu_count() or 4)
     # ProcessPoolExecutor bypasses the GIL for true CPU parallelism.
@@ -839,6 +850,31 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
         fi_to_pos = {int(fi): i for i, fi in enumerate(frame_idxs)}
         valid_fi = sorted(fi for fi in fi_to_pos if fi < n_zarr_frames)
 
+        # Sanity-check video frame count against zarr frame count.  A
+        # mismatch (typically video has fewer frames) means some frames the
+        # worker tries to read will fail; warn up front rather than after
+        # hours of compute.
+        if video_path is not None:
+            try:
+                import cv2 as _cv2_check
+                _cap_check = _cv2_check.VideoCapture(str(video_path))
+                if _cap_check.isOpened():
+                    n_video_frames = int(_cap_check.get(_cv2_check.CAP_PROP_FRAME_COUNT))
+                    if n_video_frames != n_zarr_frames:
+                        _log.warning(
+                            f"track {tid}: video reports {n_video_frames} frames, "
+                            f"zarr has {n_zarr_frames}. Frames past the smaller of "
+                            f"the two will be skipped (intensity unavailable)."
+                        )
+                    else:
+                        _log.debug(
+                            f"track {tid}: video and zarr both report "
+                            f"{n_video_frames} frames."
+                        )
+                _cap_check.release()
+            except Exception as e:
+                _log.debug(f"Could not pre-check video frame count: {e}")
+
         # per-frame result as list-of-dicts — handles dynamically-expanded
         # column names (e.g. moments_hu → moments_hu-0 … moments_hu-6)
         rows = [{} for _ in range(n)]
@@ -861,20 +897,54 @@ def compute_region_props_from_zarr(zarr_root, track_ids, frame_indices_dict, pro
             for s in range(0, len(valid_fi), _PROPS_BATCH)
         ]
 
+        # as_completed lets one bad batch fail without aborting the rest of
+        # the track — completed batches' rows survive even if a later batch
+        # crashes.  Defence against losing hours of compute to a single bug.
+        n_video_misses_total = 0
+        n_failed_batches = 0
         with ExecutorClass(max_workers=n_workers) as executor:
-            for batch_results, fi_lo, fi_hi, t_io, t_cpu, t_bin, t_bbox, t_lbl, t_rpt in tqdm(
-                executor.map(_zarr_batch_worker, batch_args),
-                total=len(batch_args),
+            future_to_range = {}
+            for args in batch_args:
+                fut = executor.submit(_zarr_batch_worker, args)
+                future_to_range[fut] = (args[2][0], args[2][-1])
+            for fut in tqdm(
+                as_completed(future_to_range),
+                total=len(future_to_range),
                 desc=f"  track {tid}", unit="batch", leave=False,
             ):
+                try:
+                    (batch_results, fi_lo, fi_hi, t_io, t_cpu,
+                     t_bin, t_bbox, t_lbl, t_rpt, n_misses) = fut.result()
+                except Exception as e:
+                    fi_lo, fi_hi = future_to_range[fut]
+                    n_failed_batches += 1
+                    _log.error(
+                        f"track {tid}: batch {fi_lo}-{fi_hi} failed ({type(e).__name__}: {e}); "
+                        f"frames in this batch will be NaN. Continuing with remaining batches."
+                    )
+                    continue
                 _log.debug(
                     f"batch {fi_lo}-{fi_hi}: zarr_read={t_io:.3f}s  "
                     f"regionprops={t_cpu:.3f}s "
                     f"(binary={t_bin:.3f}s  bbox={t_bbox:.3f}s  "
                     f"label={t_lbl:.3f}s  props_table={t_rpt:.3f}s)"
                 )
+                n_video_misses_total += n_misses
                 for pos, frame_result in batch_results.items():
                     rows[pos].update(frame_result)
+
+        if n_video_misses_total:
+            _log.info(
+                f"track {tid}: {n_video_misses_total} frame(s) skipped because the "
+                f"video read failed (likely past video EOF or a transient I/O glitch); "
+                f"those rows are NaN in the output."
+            )
+        if n_failed_batches:
+            _log.warning(
+                f"track {tid}: {n_failed_batches} batch(es) failed entirely; "
+                f"affected frame ranges are NaN in the output. Check the ERROR "
+                f"lines above for batch boundaries."
+            )
 
         # Collect all column names that actually appeared (handles expansion)
         all_keys = set()

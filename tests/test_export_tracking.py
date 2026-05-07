@@ -1113,6 +1113,62 @@ def test_weighted_spread_in_intensity_props_set():
     assert _WEIGHTED_SPREAD_PROPS <= _INTENSITY_PROPS
 
 
+def test_video_shorter_than_zarr_does_not_crash(tmp_path, caplog):
+    """Regression: when the video file is shorter than the zarr's frame count,
+    cv2.read() returns ok=False for frames past EOF.  The worker must skip
+    those frames (rather than feed intensity_image=None into a regionprops_table
+    that requested intensity_max — which raises AttributeError mid-export and
+    blows away hours of compute).  The completed frames must still land in the
+    output."""
+    import zarr
+    import cv2
+
+    pytest.importorskip("cv2")
+
+    csv_path = tmp_path / "animal_track_1.csv"
+    _write_prediction_csv(csv_path, track_id=1, n=5)
+    df = pd.read_csv(csv_path, skiprows=7)
+    n = len(df)  # 5 frames in the CSV
+
+    store_path = tmp_path / "predictions.zarr"
+    store = zarr.storage.LocalStore(str(store_path))
+    root = zarr.open_group(store=store, mode="w")
+    H, W = 64, 64
+    masks = np.zeros((n, H, W), dtype=np.int8)
+    masks[:, 16:48, 16:48] = 1
+    arr = root.require_array("1_masks", shape=(n, H, W), dtype=np.int8)
+    arr[:] = masks
+
+    # Video with FEWER frames than the zarr — emulates the real-world
+    # zarr/video mismatch that crashed the third sleep-segmentation export.
+    video_path = tmp_path / "vid.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(video_path), fourcc, 5, (W, H))
+    if not writer.isOpened():
+        pytest.skip("cv2 VideoWriter unavailable in this environment")
+    frame = np.zeros((H, W, 3), dtype=np.uint8)
+    frame[..., 2] = 255  # BGR red
+    for _ in range(2):  # only 2 frames written, vs zarr's 5
+        writer.write(frame)
+    writer.release()
+
+    # If the regression returns, this call raises AttributeError mid-export.
+    export_tracking(
+        tmp_path, output_dir=tmp_path,
+        region_properties=["intensity_mean", "intensity_max"],
+        video_path=video_path, overwrite=True,
+    )
+
+    out = pd.read_csv(csv_path, skiprows=7)
+    # The first ~2 frames have intensity computed; later frames are NaN.
+    # Either is fine — the contract is "no crash + at least the early
+    # frames have values".
+    assert "intensity_mean_r" in out.columns
+    assert out["intensity_mean_r"].notna().any(), (
+        "Expected at least one frame with computed intensity_mean_r."
+    )
+
+
 def test_translation_variant_set_classification():
     """Defensive: shape props should NOT be in the variant set; the variant
     set must contain centroid and weighted_centroid."""
