@@ -29,10 +29,14 @@ ALL_REGION_PROPERTIES = {
         'solidity',
     ),
     'Intensity': (
-        'intensity_max', 
+        'intensity_max',
         'intensity_mean',
         'intensity_min',
         'intensity_std',
+        'weighted_centroid',
+        'weighted_var_y',
+        'weighted_var_x',
+        'weighted_cov_yx',
     ),
 }
 

@@ -10,6 +10,7 @@ Subcommands
   split       Prepare and export train/val/test data from an OCTRON project
   train       Prepare training data and run YOLO model training
   predict     Run YOLO prediction and tracking on one or more videos
+  export      Export tracking CSVs from an existing predictions directory
   render      Render annotated video(s) from prediction output
               (use --bbox-sizes to report bbox sizes instead of rendering)
   transcode   Transcode video files to MP4 (H.264/libx264) using ffmpeg
@@ -206,6 +207,116 @@ def predict(
     )
 
 
+class Method(str, Enum):
+    raw      = "raw"
+    largest  = "largest"
+    weighted = "weighted"
+
+
+class Format(str, Enum):
+    csv     = "csv"
+    parquet = "parquet"
+
+
+def _list_properties_callback(value: bool):
+    if value:
+        from octron.tools.export_tracking import list_region_properties
+        list_region_properties()
+        raise typer.Exit()
+
+
+@app.command()
+def export(
+    predictions_path: Path = typer.Argument(
+        ...,
+        help="Path to an octron_predictions/<video>/ output directory.",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", "-o",
+        help="Where to write the output CSV(s). Defaults to the predictions directory.",
+    ),
+    method: Method = typer.Option(
+        Method.raw, "--method",
+        help=(
+            "How to handle multi-segment frames. "
+            "'raw': keep tuple-strings unchanged (default; matches the original "
+            "predict output, no info loss). "
+            "'largest': use values from the single largest segment. "
+            "'weighted': area-weighted mean across all segments."
+        ),
+    ),
+    region_properties: Optional[str] = typer.Option(
+        None, "--region-properties",
+        help=(
+            "Which regionprop columns to write. "
+            "Omit: keep columns already in the CSV, no zarr computation. "
+            "'all': compute every available property. "
+            "'none': strip all regionprop columns. "
+            "'shape': all size-and-shape properties. "
+            "'intensity': all intensity properties. "
+            "Otherwise a comma-separated list of names "
+            "(e.g. 'eccentricity,solidity'). "
+            "Use --list-properties to see available names."
+        ),
+    ),
+    video_path: Optional[Path] = typer.Option(
+        None, "--video",
+        help=(
+            "Path to the original video file. Required for intensity properties "
+            "(intensity_mean, intensity_max, intensity_min, intensity_std). "
+            "Auto-detected from the predictions directory name if not provided."
+        ),
+    ),
+    fmt: Format = typer.Option(
+        Format.csv, "--format",
+        help="Output format. 'csv' (default) or 'parquet' (requires pyarrow).",
+    ),
+    combined: bool = typer.Option(
+        False, "--combined",
+        help="Write a single all_tracks.<ext> instead of one file per track.",
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite",
+        help="Overwrite existing output files. Default: raise an error if files already exist.",
+    ),
+    list_properties: bool = typer.Option(
+        False, "--list-properties",
+        help="Print all available regionprop names and exit.",
+        callback=_list_properties_callback,
+        is_eager=True,
+    ),
+    debug: bool = typer.Option(
+        False, "--debug",
+        help="Enable debug logging with millisecond timestamps and per-step timing.",
+    ),
+):
+    """Export tracking CSVs from an existing OCTRON predictions directory."""
+    if debug:
+        from octron._logging import setup_logging
+        setup_logging(debug=True)
+
+    from octron.tools.export_tracking import export_tracking
+
+    _rp = region_properties.strip().lower() if region_properties is not None else None
+    if _rp is None:
+        parsed_props = None
+    elif _rp in ("none", "all", "shape", "intensity"):
+        parsed_props = _rp
+    else:
+        parsed_props = [p.strip() for p in region_properties.split(",") if p.strip()]
+
+    export_tracking(
+        predictions_path=predictions_path,
+        output_dir=output_dir,
+        method=method.value,
+        region_properties=parsed_props,
+        video_path=video_path,
+        fmt=fmt.value,
+        combined=combined,
+        overwrite=overwrite,
+    )
+
+
 @app.command()
 def render(
     predictions_path: Path = typer.Argument(
@@ -243,10 +354,6 @@ def render(
     # --- Tracklet options ---
     tracklets: bool = typer.Option(False, "--tracklets", help="Generate one crop video per tracked animal."),
     tracklet_size: Optional[str] = typer.Option("auto", "--tracklet-size", help="Side length in pixels of each tracklet crop, or 'auto' to use the largest bounding box + 20px padding."),
-    tracklet_mask_centroids: bool = typer.Option(
-        False, "--tracklet-mask-centroids",
-        help="Use mask centre-of-mass instead of bbox centre for tracklet positioning.",
-    ),
     tracklet_smooth_cutoff_hz: float = typer.Option(
         2.0, "--tracklet-smooth-cutoff", help="Butterworth low-pass cutoff (Hz) for centroid smoothing. 0=off.",
     ),
@@ -352,7 +459,6 @@ def render(
         tracklets=tracklets,
         also_overlay=resolved_masks or resolved_boxes,
         tracklet_size=parsed_tracklet_size,
-        tracklet_mask_centroids=tracklet_mask_centroids,
         tracklet_smooth_cutoff_hz=tracklet_smooth_cutoff_hz,
         tracklet_smooth_order=tracklet_smooth_order,
         tracklet_interpolate_max_gap=tracklet_interpolate,
