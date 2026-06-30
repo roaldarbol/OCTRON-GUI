@@ -1993,116 +1993,16 @@ def octron_gui():
     # Give the napari window its own Windows taskbar group (id distinct from the
     # process-wide one above) while it is still hidden, so when it is shown the
     # taskbar button is created in a group of its own and displays napari's logo
-    # instead of a generic shared-group icon. We also point the taskbar straight
-    # at napari's bundled .ico, because the napari OpenGL window does not reliably
-    # surface its Qt window icon to the taskbar on its own.
+    # instead of a generic shared-group icon. The .ico is napari's, because the
+    # napari OpenGL window does not reliably surface its Qt window icon to the
+    # taskbar on its own. See octron/_taskbar.py and tests/test_taskbar.py.
+    from octron._taskbar import set_windows_taskbar_app_id
     _napari_ico = os.path.join(os.path.dirname(napari.__file__), "resources", "icon.ico")
-    _set_windows_taskbar_app_id(
+    set_windows_taskbar_app_id(
         viewer.window._qt_window, "OCTRON-tracking.OCTRON.viewer", _napari_ico)
 
     viewer.window.show()
     napari.run()
-
-
-def _set_windows_taskbar_app_id(qt_window, app_id, icon_ico_path=None):
-    """Pin a Qt window's Windows taskbar identity and icon (Windows only).
-
-    Sets, on the window's shell property store, a per-window AppUserModelID (so
-    the window gets its own taskbar group instead of a generic shared one) and,
-    if ``icon_ico_path`` is given, a RelaunchIconResource pointing at that .ico
-    (so the taskbar draws that icon explicitly). It also force-sets the window's
-    native icon via WM_SETICON, because the napari OpenGL window does not
-    reliably surface its Qt window icon to the taskbar on its own.
-
-    Every failure (non-Windows, missing APIs, COM error) is swallowed: the
-    taskbar icon is cosmetic and must never break GUI startup.
-    """
-    import os
-
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        from ctypes import (POINTER, Structure, byref, c_byte, c_int, c_ulong,
-                            c_ushort, c_void_p, c_wchar_p, wintypes)
-
-        class GUID(Structure):
-            _fields_ = [("Data1", c_ulong), ("Data2", c_ushort),
-                        ("Data3", c_ushort), ("Data4", c_byte * 8)]
-
-        class PROPERTYKEY(Structure):
-            _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
-
-        class PROPVARIANT(Structure):
-            # x64 layout: 8-byte header then the value union (LPWSTR pointer).
-            _fields_ = [("vt", c_ushort), ("r1", c_ushort), ("r2", c_ushort),
-                        ("r3", c_ushort), ("p", c_void_p), ("pad", c_byte * 8)]
-
-        VT_LPWSTR = 31
-        ole32 = ctypes.windll.ole32
-        shell32 = ctypes.windll.shell32
-        user32 = ctypes.windll.user32
-
-        def _guid(s):
-            g = GUID()
-            if ole32.IIDFromString(c_wchar_p(s), byref(g)) != 0:
-                raise OSError("IIDFromString failed")
-            return g
-
-        # PKEY_AppUserModel_ID (pid 5) and ...RelaunchIconResource (pid 3) share
-        # one fmtid.
-        appmodel_fmtid = _guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}")
-        iid_property_store = _guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")
-
-        hwnd = int(qt_window.winId())
-
-        # 1) Per-window AppUserModelID + RelaunchIconResource via property store.
-        store = c_void_p()
-        if shell32.SHGetPropertyStoreForWindow(
-                wintypes.HWND(hwnd), byref(iid_property_store), byref(store)) == 0:
-            try:
-                funcs = ctypes.cast(
-                    ctypes.cast(store, POINTER(c_void_p))[0], POINTER(c_void_p))
-                SetValue = ctypes.WINFUNCTYPE(
-                    c_int, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT))(funcs[6])
-                Commit = ctypes.WINFUNCTYPE(c_int, c_void_p)(funcs[7])
-                ole32.CoTaskMemAlloc.restype = c_void_p
-
-                def _set_str(pid, value):
-                    nbytes = (len(value) + 1) * 2
-                    mem = ole32.CoTaskMemAlloc(nbytes)
-                    ctypes.memmove(mem, ctypes.create_unicode_buffer(value), nbytes)
-                    pv = PROPVARIANT()
-                    pv.vt = VT_LPWSTR
-                    pv.p = mem
-                    SetValue(store, byref(PROPERTYKEY(appmodel_fmtid, pid)), byref(pv))
-                    ole32.PropVariantClear(byref(pv))
-
-                _set_str(5, app_id)
-                if icon_ico_path:
-                    _set_str(3, f"{icon_ico_path},0")
-                Commit(store)
-            finally:
-                ctypes.WINFUNCTYPE(c_int, c_void_p)(
-                    ctypes.cast(ctypes.cast(store, POINTER(c_void_p))[0],
-                                POINTER(c_void_p))[2])(store)
-
-        # 2) Force the native window icon from the .ico (WM_SETICON), since the
-        # napari window's Qt icon does not reach the taskbar reliably.
-        if icon_ico_path and os.path.exists(icon_ico_path):
-            IMAGE_ICON, LR_LOADFROMFILE = 1, 0x10
-            WM_SETICON, ICON_SMALL, ICON_BIG = 0x80, 0, 1
-            user32.LoadImageW.restype = c_void_p
-            big = user32.LoadImageW(None, c_wchar_p(icon_ico_path), IMAGE_ICON,
-                                    32, 32, LR_LOADFROMFILE)
-            small = user32.LoadImageW(None, c_wchar_p(icon_ico_path), IMAGE_ICON,
-                                      16, 16, LR_LOADFROMFILE)
-            if big:
-                user32.SendMessageW(wintypes.HWND(hwnd), WM_SETICON, ICON_BIG, c_void_p(big))
-            if small:
-                user32.SendMessageW(wintypes.HWND(hwnd), WM_SETICON, ICON_SMALL, c_void_p(small))
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
