@@ -1961,20 +1961,47 @@ def octron_gui():
     #      octron-gui = "octron.main:octron_gui"
 
     """
+    import os, sys
+
+    # Process-wide AppUserModelID before the QApplication exists. Qt/vispy's
+    # hidden helper windows inherit this; the visible napari window gets its own
+    # (distinct) id below so it does not share a taskbar group with them.
+    if os.name == "nt" and not getattr(sys, "frozen", False):
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OCTRON-tracking.OCTRON")
+
     from octron._logging import setup_logging
     setup_logging()
 
-    viewer = napari.Viewer()
-    
-    # If there's already a QApplication instance (as may be the case when running as a napari plugin),
-    # then set its style explicitly:
-    app = QApplication.instance()
-    if app is not None:
-        # This is a hack to get the style to look similar on darwin and windows systems
-        # for the ToolBox widget
-        app.setStyle(QStyleFactory.create("Fusion")) 
-    
+    # Create the QApplication ourselves so napari's get_app() reuses it.
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    # Apply the Fusion style (a hack to make the ToolBox widget look consistent
+    # across macOS and Windows) *before* any window is created. Changing the
+    # application style after a window has been shown re-polishes/recreates it
+    # and, on Windows, destroys its taskbar identity so the taskbar button falls
+    # back to a generic icon. Setting it up front avoids that entirely.
+    app.setStyle(QStyleFactory.create("Fusion"))
+
+    # Build the viewer *hidden* so we can set the window's own taskbar identity
+    # before it is ever shown. Windows creates a window's taskbar button the first
+    # time it is shown and binds the button's AppUserModelID at that moment;
+    # changing the id afterwards does not reliably re-group an existing button.
+    viewer = napari.Viewer(show=False)
     viewer.window.add_dock_widget(octron_widget(viewer))
+
+    # Give the napari window its own Windows taskbar group (id distinct from the
+    # process-wide one above) while it is still hidden, so when it is shown the
+    # taskbar button is created in a group of its own and displays napari's logo
+    # instead of a generic shared-group icon. The .ico is napari's, because the
+    # napari OpenGL window does not reliably surface its Qt window icon to the
+    # taskbar on its own. See octron/_taskbar.py and tests/test_taskbar.py.
+    from octron._taskbar import set_windows_taskbar_app_id
+    _napari_ico = os.path.join(os.path.dirname(napari.__file__), "resources", "icon.ico")
+    set_windows_taskbar_app_id(
+        viewer.window._qt_window, "OCTRON-tracking.OCTRON.viewer", _napari_ico)
+
+    viewer.window.show()
     napari.run()
 
 
