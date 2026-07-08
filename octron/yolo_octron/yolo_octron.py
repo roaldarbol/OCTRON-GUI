@@ -1058,6 +1058,7 @@ class YOLO_octron:
               train_mode='segment',
               resume=False,
               batch=-1,
+              cache='disk',
               ):
         """
         Train the YOLO model with epoch progress updates
@@ -1077,7 +1078,12 @@ class YOLO_octron:
         resume : bool
             If True, resume training from the loaded checkpoint (last.pt).
             Most training parameters are restored from the checkpoint.
-            
+        cache : str or bool
+            Dataset caching for faster training. 'disk' (default) caches
+            preprocessed images on disk, 'ram' (or True) caches them in RAM
+            for fastest access (requires enough memory to hold the dataset),
+            'none' (or False) disables caching.
+
         Yields
         ------
         dict
@@ -1212,6 +1218,27 @@ class YOLO_octron:
             print("⚠ MPS is not yet fully supported in PyTorch. Use at your own risk.")
         
         assert imagesz % 32 == 0, 'YOLO image size must be a multiple of 32'
+
+        # Coerce/validate the cache mode at the API boundary so the method is
+        # safe to call directly, not only via the CLI. Maps to the value
+        # ultralytics expects: 'disk', 'ram', or False (no caching).
+        if isinstance(cache, str):
+            cache_str = cache.lower()
+            if cache_str in ('none', 'false', 'off'):
+                cache = False
+            elif cache_str in ('ram', 'true'):
+                cache = 'ram'
+            elif cache_str == 'disk':
+                cache = 'disk'
+            else:
+                raise ValueError(
+                    f"Invalid cache mode: {cache!r}. Expected 'disk', 'ram', or 'none'."
+                )
+        else:
+            cache = bool(cache)
+            if cache:
+                cache = 'ram'
+
         # Start training in a separate thread
         training_complete = threading.Event()
         training_error = None
@@ -1250,7 +1277,7 @@ class YOLO_octron:
                     patience=100,
                     plots=True,
                     batch=batch,
-                    cache='disk', # for fast access
+                    cache=cache, # 'disk', 'ram', or False — see train() cache arg
                     save=True,
                     save_period=save_period,
                     exist_ok=True,

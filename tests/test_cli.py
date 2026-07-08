@@ -10,7 +10,7 @@ gui         --help
 gpu-test    --help; gpu-test runs (skipped if torch DLLs unavailable)
 split       --help: --mode, --train, --val, --seed, --dry-run
 train       --help: --model, --mode, --device, --epochs, --imagesz,
-                    --save-period, --overwrite, --resume, --no-split,
+                    --save-period, --cache, --overwrite, --resume, --no-split,
                     --train, --val, --seed
 predict     --help: --model, --tracker, --tracker-config, --device,
                     --conf-thresh, --iou-thresh, --skip-frames,
@@ -112,6 +112,7 @@ def test_train_help():
     assert '--epochs' in out
     assert '--imagesz' in out
     assert '--save-period' in out
+    assert '--cache' in out
     assert '--overwrite' in out
     assert '--resume' in out
     assert '--no-split' in out

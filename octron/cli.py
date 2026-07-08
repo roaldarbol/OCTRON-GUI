@@ -50,6 +50,12 @@ class Device(str, Enum):
     cuda = "cuda"
     mps = "mps"
 
+
+class CacheMode(str, Enum):
+    disk = "disk"
+    ram = "ram"
+    none = "none"
+
 app = typer.Typer(
     name="octron",
     help="OCTRON – segmentation and tracking for animal behavior quantification.",
@@ -121,6 +127,7 @@ def train(
     epochs: int = typer.Option(250, help="Number of training epochs."),
     imagesz: int = typer.Option(640, help="Input image size."),
     save_period: int = typer.Option(50, help="Save a checkpoint every N epochs."),
+    cache: CacheMode = typer.Option(CacheMode.disk, help="Cache the dataset for faster training: 'disk' (default), 'ram' (fastest, needs enough RAM to hold the dataset), or 'none'."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite an existing trained model. Default: skip if best.pt already exists."),
     resume: bool = typer.Option(False, help="Resume from an existing last.pt checkpoint."),
     no_split: bool = typer.Option(False, "--no-split", help="Skip data preparation. Use when 'octron split' has already been run."),
@@ -139,6 +146,7 @@ def train(
         epochs=epochs,
         imagesz=imagesz,
         save_period=save_period,
+        cache=cache,
         overwrite=overwrite,
         resume=resume,
         skip_split=no_split,

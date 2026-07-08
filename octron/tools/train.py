@@ -72,6 +72,7 @@ def run_training(
     epochs=250,
     imagesz=640,
     save_period=50,
+    cache="disk",
     overwrite=False,
     resume=False,
     skip_split=False,
@@ -100,6 +101,9 @@ def run_training(
         Input image size for training.
     save_period : int
         Save a checkpoint every N epochs.
+    cache : str
+        Dataset caching for faster training: 'disk' (default), 'ram'
+        (fastest, requires enough RAM to hold the dataset), or 'none'.
     train_mode : str
         'segment' for instance segmentation, 'detect' for bounding-box detection.
     resume : bool
@@ -122,6 +126,7 @@ def run_training(
     # object tags when written into YAML config files downstream.
     train_mode = train_mode.value if hasattr(train_mode, 'value') else str(train_mode)
     device = device.value if hasattr(device, 'value') else str(device)
+    cache = cache.value if hasattr(cache, 'value') else str(cache)
 
     best_pt = Path(project_path) / "model" / "training" / "weights" / "best.pt"
     last_pt = Path(project_path) / "model" / "training" / "weights" / "last.pt"
@@ -180,6 +185,7 @@ def run_training(
         train_mode=train_mode,
         resume=resume,
         batch=batch,
+        cache=cache,
     ):
         epoch = progress.get("epoch", "?")
         total_epochs = progress.get("total_epochs", "?")
