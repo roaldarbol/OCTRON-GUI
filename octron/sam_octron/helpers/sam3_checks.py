@@ -1,8 +1,8 @@
 # Code for checking the availability of the SAM3 model checkpoint and config
-import os
 from pathlib import Path
 import yaml
 from loguru import logger
+from octron.paths import get_sam_cache_dir, reuse_legacy_weight
 
 
 SAM3_HF_REPO = "facebook/sam3"
@@ -84,13 +84,16 @@ def check_sam3_models(models_yaml_path, force_download=False):
         assert 'name' in models_dict[model_id], f"Name not found for model {model_id} in yaml file"
         assert 'checkpoint_path' in models_dict[model_id], f"Checkpoint path not found for model {model_id} in yaml file"
 
-    # Collect unique checkpoint files that need downloading
-    checkpoints_dir = sam3_path / 'checkpoints'
-    if not checkpoints_dir.exists():
-        os.makedirs(checkpoints_dir, exist_ok=True)
+    # Checkpoints live in the shared, environment-independent cache so a fresh
+    # install/env does not re-download them. See octron.paths.
+    checkpoints_dir = get_sam_cache_dir()
+    legacy_dir = sam3_path / 'checkpoints'  # pre-cache package location
 
     try:
         for fname in SAM3_FILES:
+            # Reuse files left behind by an older, package-local install.
+            if not force_download:
+                reuse_legacy_weight(legacy_dir / fname, checkpoints_dir / fname)
             download_sam3_file(
                 filename=fname,
                 local_dir=checkpoints_dir,
@@ -111,7 +114,7 @@ def check_sam3_models(models_yaml_path, force_download=False):
 
     # Verify checkpoint paths from YAML actually exist
     for model_id, model in models_dict.items():
-        ckpt_path = sam3_path / model['checkpoint_path']
+        ckpt_path = checkpoints_dir / Path(model['checkpoint_path']).name
         if not ckpt_path.exists():
             print(f"⚠️ {ckpt_path} not found after download attempt.")
             return {}

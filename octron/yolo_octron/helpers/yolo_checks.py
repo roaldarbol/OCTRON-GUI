@@ -1,10 +1,10 @@
 # Code for checking the availability of the YOLO models
-import os
 from pathlib import Path
 import requests
 import yaml
 from loguru import logger
 from octron.url_check import check_url_availability
+from octron.paths import get_yolo_cache_dir, reuse_legacy_weight
 
 
 def download_yolo_model(url, 
@@ -88,12 +88,11 @@ def check_yolo_models(YOLO_BASE_URL,
         YOLO_BASE_URL="https://github.com/ultralytics/assets/releases/download/v8.4.0" 
     
     assert models_yaml_path.exists(), f"Path {models_yaml_path} does not exist"
-    yolo_model_path = models_yaml_path.parent / 'models' # OCTRON convention. Currently not changeable.
-    if yolo_model_path.exists():
-        logger.debug(f"Models folder {yolo_model_path} exists.")
-    else:
-        os.mkdir(yolo_model_path)
-        logger.info(f"Created YOLO models folder {yolo_model_path}")
+    # Weights live in a shared, environment-independent cache so a fresh
+    # install/env does not re-download them. See octron.paths.
+    yolo_model_path = get_yolo_cache_dir()
+    legacy_model_path = models_yaml_path.parent / 'models'  # pre-cache package location
+    logger.debug(f"Using YOLO weights cache {yolo_model_path}")
     
     # Load the model YAML file and convert it to a dictionary
     with open(models_yaml_path, 'r') as file:
@@ -107,7 +106,12 @@ def check_yolo_models(YOLO_BASE_URL,
 
         # Download both segmentation and detection model variants
         for path_key in ('model_path_seg', 'model_path_detect'):
-            model_path = (yolo_model_path / models_dict[model][path_key])
+            model_name = models_dict[model][path_key]
+            model_path = (yolo_model_path / model_name)
+            # Reuse a weight left behind by an older, package-local install
+            # before falling back to a fresh download.
+            if not force_download:
+                reuse_legacy_weight(legacy_model_path / model_name, model_path)
             # Check if the model file exists. If not, download it.
             if model_path.exists() and not force_download:
                 logger.info(f"Model file {model_path} exists. Skipping download.")

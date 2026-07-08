@@ -1,10 +1,10 @@
 # Code for checking the availability of the SAM2 model configurations and checkpoints
-import os
 from pathlib import Path
 import requests
 import yaml
 from loguru import logger
 from octron.url_check import check_url_availability
+from octron.paths import get_sam_cache_dir, reuse_legacy_weight
 
 
 def download_sam2_checkpoint(url, 
@@ -106,14 +106,17 @@ def check_sam2_models(SAM2p1_BASE_URL,
         assert 'config_path' in models_dict[model], f"Config path not found for model {model} in yaml file"
         assert 'checkpoint_path' in models_dict[model], f"Checkpoint path not found for model {model} in yaml file"
 
-        # Some sanity checks on the actual paths
+        # Config files ship with the package and stay package-relative.
         model_config_path = (sam2_path  / models_dict[model]['config_path'])
-        assert model_config_path.exists(), f"Config file {model_config_path} does not exist" 
-        model_checkpt_path = (sam2_path  / models_dict[model]['checkpoint_path'])
-        if not model_checkpt_path.parent.exists():
-            os.mkdir(model_checkpt_path.parent)
-        assert model_checkpt_path.parent.exists(), f"Checkpoint folder {model_checkpt_path.parent} does not exist"
-        
+        assert model_config_path.exists(), f"Config file {model_config_path} does not exist"
+        # Checkpoints live in the shared, environment-independent cache so a
+        # fresh install/env does not re-download them. See octron.paths.
+        checkpoint_name = Path(models_dict[model]['checkpoint_path']).name
+        model_checkpt_path = get_sam_cache_dir() / checkpoint_name
+        # Reuse a checkpoint left behind by an older, package-local install.
+        if not force_download:
+            reuse_legacy_weight(sam2_path / models_dict[model]['checkpoint_path'], model_checkpt_path)
+
         # Check if the checkpoint file exists. If not, download it.
         if model_checkpt_path.exists() and not force_download:
             logger.info(f"Checkpoint file {model_checkpt_path} exists. Skipping download.")

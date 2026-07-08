@@ -1,5 +1,11 @@
 #### Changelog
 
+## Unreleased
+
+### Features & Enhancements
+- Shared model cache — YOLO and SAM2/SAM3 weights are now stored in a common, environment-independent cache directory (platform user-cache dir, e.g. `%LOCALAPPDATA%\octron\Cache` on Windows / `~/.cache/octron` on Linux) instead of inside the installed package. Installing OCTRON into a new virtual environment no longer re-downloads the weights. Override the location with the `OCTRON_CACHE_DIR` environment variable. Weights already downloaded into an older, package-local install are reused automatically (no re-download).
+- Training cache option — `octron train` gained a `--cache` option (`disk` (default), `ram`, or `none`) to control dataset caching; `--cache ram` gives the fastest training when enough RAM is available.
+
 ## vers. 0.2
 - Date: 2026-03-06
 - 98 commits since v0.1

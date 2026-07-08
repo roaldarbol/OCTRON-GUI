@@ -1008,9 +1008,10 @@ class YOLO_octron:
             # If this path exists, load this model, otherwise 
             # assume that this models is part of the models_dict
         except AssertionError:
+            from octron.paths import get_yolo_cache_dir
             model_key = 'model_path_detect' if train_mode == 'detect' else 'model_path_seg'
             model_name_path = self.models_dict[model_name_path][model_key]
-            model_name_path = self.models_yaml_path.parent / f'models/{model_name_path}'
+            model_name_path = get_yolo_cache_dir() / model_name_path
             
         model = YOLO(model_name_path)
         self.model = model
