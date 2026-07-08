@@ -47,27 +47,34 @@ def download_sam2_checkpoint(url,
             
             
             
-def check_sam2_models(SAM2p1_BASE_URL, 
+def check_sam2_models(SAM2p1_BASE_URL,
                       models_yaml_path,
                       force_download = False,
+                      download = True,
                       ):
     """
     Check the availability of the SAM2 model configurations and checkpoints.
     Optionally download the files if they are not available or if force_download is set to True.
-    
-    
+
+
     Parameters
     ----------
     SAM2p1_BASE_URL : str
-        Base URL to download the models from. 
+        Base URL to download the models from.
         For example "https://dl.fbaipublicfiles.com/segment_anything_2/092824"
         If not provided, the default URL will be used.
     models_yaml_path : str or Path
-        Path to the models yaml file. 
+        Path to the models yaml file.
         For example "sam_octron/sam2_models.yaml"
     force_download : bool
-        If True, download the model even if it already exists. 
+        If True, download the model even if it already exists.
         Default is False.
+    download : bool
+        If True (default), ensure the checkpoint files are present,
+        downloading any that are missing. If False, only parse and validate
+        the model metadata (and packaged config files) and return it without
+        touching the network — useful for populating the GUI instantly and
+        deferring downloads to a background thread.
 
     Returns
     -------
@@ -109,6 +116,11 @@ def check_sam2_models(SAM2p1_BASE_URL,
         # Config files ship with the package and stay package-relative.
         model_config_path = (sam2_path  / models_dict[model]['config_path'])
         assert model_config_path.exists(), f"Config file {model_config_path} does not exist"
+
+        # Metadata-only pass: skip any checkpoint filesystem/network work.
+        if not download:
+            continue
+
         # Checkpoints live in the shared, environment-independent cache so a
         # fresh install/env does not re-download them. See octron.paths.
         checkpoint_name = Path(models_dict[model]['checkpoint_path']).name

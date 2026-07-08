@@ -69,10 +69,11 @@ class YOLO_octron:
     
     """
     
-    def __init__(self, 
+    def __init__(self,
                  models_yaml_path=None,
                  project_path = None,
-                 clean_training_dir=True
+                 clean_training_dir=True,
+                 download_models=True,
                  ):
         """
         Initialize YOLO_octron with project and model paths.
@@ -86,7 +87,13 @@ class YOLO_octron:
         clean_training_dir : bool
             Whether to clean the training directory if it is not empty.
             Default is True.
-            
+        download_models : bool
+            If True (default), ensure the base YOLO weights are present,
+            downloading any that are missing during construction. If False,
+            only parse the model metadata from the YAML and defer the
+            (potentially slow) download to the caller — used by the GUI so
+            startup does not stall on the network.
+
         """
         self.clean_training_dir = clean_training_dir
         try:
@@ -114,7 +121,8 @@ class YOLO_octron:
             # Check YOLO models, download if needed
             self.models_dict = check_yolo_models(YOLO_BASE_URL=None,
                                                 models_yaml_path=self.models_yaml_path,
-                                                force_download=False
+                                                force_download=False,
+                                                download=download_models,
                                                 )
         else:
             logger.warning("No models YAML path provided. Model dictionary will be empty.")

@@ -42,6 +42,7 @@ from octron.sam_octron.helpers.sam_zarr import (
 from octron.yolo_octron.gui.yolo_handler import YoloHandler
 from octron.yolo_octron.helpers.training import collect_labels, load_object_organizer
 from octron.yolo_octron.yolo_octron import YOLO_octron
+from octron.yolo_octron.helpers.yolo_checks import check_yolo_models
 from octron.yolo_octron.constants import TASK_COLORS
 
 # Napari plugin QT components
@@ -146,22 +147,33 @@ class octron_widget(QWidget):
                              # For zarr arrays I set the minimum to ~50 frames for now
         self.skip_frames = 1 # Skip frames for prefetching images
     
+        # Model metadata is parsed synchronously here (fast, local YAML) so the
+        # dropdowns populate instantly. The actual weight downloads (which can
+        # take a while on a fresh install) are deferred to a background thread
+        # started at the end of __init__ so the GUI never stalls on the network.
+        # See _start_model_downloads / _download_models below.
+        #
         # Model yaml for SAM2
-        sam2models_yaml_path = self.base_path / 'sam_octron/sam2_models.yaml'
+        self.sam2models_yaml_path = self.base_path / 'sam_octron/sam2_models.yaml'
         self.sam2models_dict = check_sam2_models(SAM2p1_BASE_URL='',
-                                                 models_yaml_path=sam2models_yaml_path,
+                                                 models_yaml_path=self.sam2models_yaml_path,
                                                  force_download=False,
+                                                 download=False,
                                                  )
         # Model yaml for SAM3
-        sam3models_yaml_path = self.base_path / 'sam_octron/sam3_models.yaml'
-        self.sam3models_dict = check_sam3_models(models_yaml_path=sam3models_yaml_path,
+        self.sam3models_yaml_path = self.base_path / 'sam_octron/sam3_models.yaml'
+        self.sam3models_dict = check_sam3_models(models_yaml_path=self.sam3models_yaml_path,
                                                  force_download=False,
+                                                 download=False,
                                                  )
-        
+
         # Model yaml for YOLO
         yolo_models_yaml_path = self.base_path / 'yolo_octron/yolo_models.yaml'
-        self.yolo_octron = YOLO_octron(models_yaml_path=yolo_models_yaml_path) # Feeding in yaml to initiate models dict
-        self.yolomodels_dict = self.yolo_octron.models_dict 
+        # Feeding in yaml to initiate models dict; weights download in background.
+        self.yolo_octron = YOLO_octron(models_yaml_path=yolo_models_yaml_path,
+                                       download_models=False)
+        self.yolomodels_dict = self.yolo_octron.models_dict
+        self.model_download_worker = None  # Background weight downloader
         
         # Model yaml for Trackers
         trackers_yaml_path = self.base_path / 'tracking/boxmot_trackers.yaml'
@@ -215,6 +227,84 @@ class octron_widget(QWidget):
             self.sam_octron_callbacks.feed_rectangles_to_predictor
         )
         print(f'OCTRON GUI v{octron_version} initialized')
+
+        # Kick off the (potentially slow) model weight downloads in the
+        # background now that the GUI is fully constructed and visible.
+        self._start_model_downloads()
+
+    ###################################################################################################
+
+    def _start_model_downloads(self):
+        """
+        Download the SAM2/SAM3/YOLO weights in a background thread.
+
+        The model metadata was already parsed synchronously in __init__, so the
+        dropdowns are usable immediately. This just ensures the (multi-hundred-MB)
+        weight files land in the shared cache without blocking the GUI thread.
+        A guard in load_sam2model / load_sam3model handles the case where the
+        user tries to load a model before its download has finished.
+        """
+        self.model_download_worker = create_worker(self._download_models)
+        self.model_download_worker.returned.connect(self._on_model_downloads_finished)
+        self.model_download_worker.start()
+
+    def _download_models(self):
+        """
+        Worker body (runs off the GUI thread): ensure all model weights are
+        present. Each family is downloaded independently so a failure in one
+        (e.g. a gated SAM3 checkpoint) does not prevent the others.
+
+        Returns a dict of per-family success flags consumed on the GUI thread
+        by _on_model_downloads_finished.
+        """
+        results = {'sam2': False, 'sam3': False, 'yolo': False}
+        try:
+            check_sam2_models(SAM2p1_BASE_URL='',
+                              models_yaml_path=self.sam2models_yaml_path,
+                              force_download=False,
+                              download=True)
+            results['sam2'] = True
+        except Exception as e:
+            logger.warning(f"Background SAM2 weight download failed: {e}")
+
+        try:
+            # Empty dict means the SAM3 checkpoint could not be fetched
+            # (e.g. licence not accepted / not logged in to HuggingFace).
+            sam3_dict = check_sam3_models(models_yaml_path=self.sam3models_yaml_path,
+                                          force_download=False,
+                                          download=True)
+            results['sam3'] = bool(sam3_dict)
+        except Exception as e:
+            logger.warning(f"Background SAM3 weight download failed: {e}")
+
+        try:
+            check_yolo_models(YOLO_BASE_URL=None,
+                              models_yaml_path=self.yolo_octron.models_yaml_path,
+                              force_download=False,
+                              download=True)
+            results['yolo'] = True
+        except Exception as e:
+            logger.warning(f"Background YOLO weight download failed: {e}")
+
+        return results
+
+    def _on_model_downloads_finished(self, results):
+        """
+        GUI-thread callback once background weight downloads complete.
+
+        If the SAM3 checkpoint could not be fetched, drop the SAM3 entries from
+        the dropdown (mirroring the old behaviour where check_sam3_models
+        returned an empty dict and no entries were added), so the user is not
+        offered a model that cannot be loaded.
+        """
+        if not results.get('sam3', False) and self.sam3models_dict:
+            logger.warning("SAM3 weights unavailable — removing SAM3 models from the list.")
+            for model in self.sam3models_dict.values():
+                idx = self.sam_model_list.findText(model['name'])
+                if idx >= 0:
+                    self.sam_model_list.removeItem(idx)
+            self.sam3models_dict = {}
+        logger.info(f"Model weight downloads finished: {results}")
 
     ###################################################################################################
     
@@ -409,7 +499,28 @@ class octron_widget(QWidget):
         # Fall back to SAM2
         self.load_sam2model(model_name=model_name)
     
-    def load_sam2model(self, 
+    def _ensure_checkpoint_ready(self, checkpoint_path, model_name):
+        """
+        Return True if the model checkpoint is available on disk.
+
+        Weight downloads run in the background at startup, so a user may try to
+        load a model before its file has finished downloading. In that case,
+        inform them and abort the load gracefully rather than crashing on a
+        missing/partial file.
+        """
+        if Path(checkpoint_path).exists():
+            return True
+        if self.model_download_worker is not None and self.model_download_worker.is_running:
+            msg = (f"'{model_name}' is still downloading in the background. "
+                   "Please wait a moment and try again.")
+        else:
+            msg = (f"The weights for '{model_name}' are not available "
+                   f"({checkpoint_path}). Check your connection and restart OCTRON.")
+        logger.warning(msg)
+        show_warning(msg)
+        return False
+
+    def load_sam2model(self,
                        model_name='',
                        ):
         """
@@ -443,6 +554,8 @@ class octron_widget(QWidget):
         model = self.sam2models_dict[model_id]
         config_path = Path(model['config_path'])
         checkpoint_path = get_sam_cache_dir() / Path(model['checkpoint_path']).name
+        if not self._ensure_checkpoint_ready(checkpoint_path, model_name):
+            return
         self.predictor, self.device = build_sam2_octron(config_file_path=config_path.as_posix(),
                                                         ckpt_path=checkpoint_path.as_posix(),
                                                         )
@@ -478,6 +591,8 @@ class octron_widget(QWidget):
         from octron.paths import get_sam_cache_dir
         model = self.sam3models_dict[model_id]
         checkpoint_path = get_sam_cache_dir() / Path(model['checkpoint_path']).name
+        if not self._ensure_checkpoint_ready(checkpoint_path, model_name):
+            return
         semantic = model.get('semantic', False)
         self.predictor, self.device = build_sam3_octron(
             ckpt_path=checkpoint_path.as_posix(),

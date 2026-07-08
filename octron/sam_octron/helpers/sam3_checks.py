@@ -51,19 +51,25 @@ def download_sam3_file(filename, local_dir, overwrite=False):
     return Path(cached_path)
 
 
-def check_sam3_models(models_yaml_path, force_download=False):
+def check_sam3_models(models_yaml_path, force_download=False, download=True):
     """
     Load SAM3 model definitions from a YAML file and ensure the
     checkpoint files are available locally (downloading from
     HuggingFace if missing).
-    
+
     Parameters
     ----------
     models_yaml_path : str or Path
         Path to the sam3_models.yaml file.
     force_download : bool
         Re-download even if files exist.
-    
+    download : bool
+        If True (default), ensure the checkpoint files are present,
+        downloading any that are missing, and return an empty dict if the
+        download fails. If False, only parse and validate the model metadata
+        and return it without touching the network — useful for populating
+        the GUI instantly and deferring downloads to a background thread.
+
     Returns
     -------
     models_dict : dict
@@ -83,6 +89,12 @@ def check_sam3_models(models_yaml_path, force_download=False):
     for model_id in models_dict:
         assert 'name' in models_dict[model_id], f"Name not found for model {model_id} in yaml file"
         assert 'checkpoint_path' in models_dict[model_id], f"Checkpoint path not found for model {model_id} in yaml file"
+
+    # Metadata-only pass: return the parsed definitions without touching the
+    # network. The caller is responsible for triggering the download later
+    # (e.g. on a background thread) and for verifying the checkpoint landed.
+    if not download:
+        return models_dict
 
     # Checkpoints live in the shared, environment-independent cache so a fresh
     # install/env does not re-download them. See octron.paths.

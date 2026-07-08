@@ -45,28 +45,35 @@ def download_yolo_model(url,
             
                
             
-def check_yolo_models(YOLO_BASE_URL, 
+def check_yolo_models(YOLO_BASE_URL,
                       models_yaml_path,
                       force_download = False,
+                      download = True,
                       ):
     """
     Check the availability of the YOLO model.
-    Optionally download the model file if they are not available 
+    Optionally download the model file if they are not available
     or if force_download is set to True.
-    
-    
+
+
     Parameters
     ----------
     YOLO_BASE_URL : str
-        Base URL to download the models from. 
+        Base URL to download the models from.
         For example "https://github.com/ultralytics/assets/releases/download/v8.3.0"
         If not provided, the default URL is used.
     models_yaml_path : str or Path
-        Path to the YAML file containing the model information. 
-        For example "yolo_octron/models.yaml"    
+        Path to the YAML file containing the model information.
+        For example "yolo_octron/models.yaml"
     force_download : bool
-        If True, download the model even if it already exists. 
+        If True, download the model even if it already exists.
         Default is False.
+    download : bool
+        If True (default), ensure the weight files are present, downloading
+        any that are missing. If False, only parse and validate the model
+        metadata from the YAML and return it without touching the network —
+        useful for populating the GUI instantly and deferring downloads to a
+        background thread.
 
     Returns
     -------
@@ -103,6 +110,10 @@ def check_yolo_models(YOLO_BASE_URL,
         assert 'name' in models_dict[model], f"Name not found for model {model} in yaml file"
         assert 'model_path_seg' in models_dict[model], f"Segmentation model path not found for model {model} in yaml file"
         assert 'model_path_detect' in models_dict[model], f"Detection model path not found for model {model} in yaml file"
+
+        # Metadata-only pass: skip any filesystem/network work.
+        if not download:
+            continue
 
         # Download both segmentation and detection model variants
         for path_key in ('model_path_seg', 'model_path_detect'):
